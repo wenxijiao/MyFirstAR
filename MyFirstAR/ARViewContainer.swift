@@ -22,6 +22,9 @@ struct ARViewContainer: UIViewRepresentable {
     @Binding var collectedCoins: Int
     @Binding var isWarning: Bool
     @Binding var dangerLevel: Float
+    @Binding var warningDistance: Float
+    @Binding var deathDistance: Float
+    @Binding var deathEnabled: Bool
     @Binding var commands: ARCommands
     @Binding var arReadyFinished: Bool
 
@@ -33,6 +36,9 @@ struct ARViewContainer: UIViewRepresentable {
             collectedCoins: $collectedCoins,
             isWarning: $isWarning,
             dangerLevel: $dangerLevel,
+            warningDistance: $warningDistance,
+            deathDistance: $deathDistance,
+            deathEnabled: $deathEnabled,
             commands: $commands,
             arReadyFinished: $arReadyFinished
         )
@@ -42,11 +48,7 @@ struct ARViewContainer: UIViewRepresentable {
         let arView = ARView(frame: .zero)
 
         // MARK: - AR Config
-        let config = ARWorldTrackingConfiguration()
-        config.planeDetection = [.horizontal]
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-            config.sceneReconstruction = .mesh
-        }
+        let config = makeSessionConfiguration()
         arView.session.run(config)
 
         // Lighting & Occlusion
@@ -67,6 +69,15 @@ struct ARViewContainer: UIViewRepresentable {
         return arView
     }
 
+    private func makeSessionConfiguration() -> ARWorldTrackingConfiguration {
+        let config = ARWorldTrackingConfiguration()
+        config.planeDetection = [.horizontal]
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            config.sceneReconstruction = .mesh
+        }
+        return config
+    }
+
     func updateUIView(_ uiView: ARView, context: Context) {
         context.coordinator.handleCommands(commands)
     }
@@ -83,6 +94,9 @@ struct ARViewContainer: UIViewRepresentable {
         private let collectedCoins: Binding<Int>
         private let isWarning: Binding<Bool>
         private let dangerLevel: Binding<Float>
+        private let warningDistance: Binding<Float>
+        private let deathDistance: Binding<Float>
+        private let deathEnabled: Binding<Bool>
         private let commands: Binding<ARCommands>
         private let arReadyFinished: Binding<Bool>
 
@@ -92,6 +106,9 @@ struct ARViewContainer: UIViewRepresentable {
              collectedCoins: Binding<Int>,
              isWarning: Binding<Bool>,
              dangerLevel: Binding<Float>,
+             warningDistance: Binding<Float>,
+             deathDistance: Binding<Float>,
+             deathEnabled: Binding<Bool>,
              commands: Binding<ARCommands>,
              arReadyFinished: Binding<Bool>) {
 
@@ -101,6 +118,9 @@ struct ARViewContainer: UIViewRepresentable {
             self.collectedCoins = collectedCoins
             self.isWarning = isWarning
             self.dangerLevel = dangerLevel
+            self.warningDistance = warningDistance
+            self.deathDistance = deathDistance
+            self.deathEnabled = deathEnabled
             self.commands = commands
             self.arReadyFinished = arReadyFinished
             // ✅ 关键：避免第一次 updateUIView 时把所有 token 都当成“变化”
@@ -110,6 +130,29 @@ struct ARViewContainer: UIViewRepresentable {
 
             super.init()
             setupAudioSession()
+            // 预热：避免第一次进 ready/play 时才加载资源导致卡顿
+            prewarmOnce()
+        }
+
+        private var didPrewarm: Bool = false
+        private func prewarmOnce() {
+            guard !didPrewarm else { return }
+            didPrewarm = true
+
+            // 1) 预热音效池
+            prepareSfxPoolIfNeeded()
+
+            // 2) 预热模型模板（触发 lazy load）
+            _ = coinTemplate
+            _ = giftBoxTemplate
+            _ = hamburgerTemplate
+            _ = sakuraTemplate
+
+            // 3) 预热缩放校准（需要 arView，在第一次拿到 arView 时做）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, let arView = self.arView else { return }
+                self.calibratePathVariantScalesIfNeeded(in: arView)
+            }
         }
 
         // MARK: - Audio
@@ -125,22 +168,45 @@ struct ARViewContainer: UIViewRepresentable {
 
         private let soundName = "coin"
         private let soundExt  = "wav"
-        private var sfxPlayer: AVAudioPlayer?
+        // 用 pool 避免频繁创建 player（减少卡顿/覆盖音效）
+        private var sfxPlayers: [AVAudioPlayer] = []
+        private var sfxIndex: Int = 0
+        private let sfxPoolSize: Int = 8
 
-        private func playCoinSound() {
-            guard let url = Bundle.main.url(forResource: soundName, withExtension: soundExt) else {
+        private lazy var coinSfxURL: URL? = {
+            Bundle.main.url(forResource: soundName, withExtension: soundExt)
+        }()
+
+        private func prepareSfxPoolIfNeeded() {
+            guard sfxPlayers.isEmpty else { return }
+            guard let url = coinSfxURL else {
                 print("❌ sound not found:", soundName, soundExt)
                 return
             }
             do {
+                sfxPlayers = try (0..<sfxPoolSize).map { _ in
                 let p = try AVAudioPlayer(contentsOf: url)
-                p.volume = Float.random(in: 0.45...0.60)
+                    p.volume = 0.55
                 p.prepareToPlay()
-                p.play()
-                self.sfxPlayer = p
+                    return p
+                }
+                sfxIndex = 0
             } catch {
-                print("❌ Sound error:", error)
+                print("❌ Sound pool error:", error)
+                sfxPlayers.removeAll()
             }
+        }
+
+        private func playCoinSound() {
+            prepareSfxPoolIfNeeded()
+            guard !sfxPlayers.isEmpty else { return }
+
+            let i = sfxIndex
+            sfxIndex = (sfxIndex + 1) % sfxPlayers.count
+            let p = sfxPlayers[i]
+            p.currentTime = 0
+            p.volume = Float.random(in: 0.45...0.65)
+            p.play()
         }
 
         // MARK: - Commands token tracking
@@ -148,6 +214,12 @@ struct ARViewContainer: UIViewRepresentable {
         private var playStartedAt: CFTimeInterval = 0
         // 入场保护：避免开局离路径远直接判死
         private let playGraceDuration: CFTimeInterval = 10.0
+
+        // MARK: - Path distance perf
+        private var lastNearestPathIndex: Int = 0
+        private let nearestSearchWindow: Int = 80
+        private var fullScanCooldown: Int = 0
+        private let fullScanEveryNFrames: Int = 45
 
         func handleCommands(_ new: ARCommands) {
 
@@ -200,12 +272,14 @@ struct ARViewContainer: UIViewRepresentable {
             case coin
             case giftBox
             case hamburger
+            case sakura
 
             var modelName: String {
                 switch self {
                 case .coin: return "coin.usdz"
                 case .giftBox: return "giftBox.usdz"
                 case .hamburger: return "hamburger.usdz"
+                case .sakura: return "sakura.usdz"
                 }
             }
         }
@@ -214,12 +288,14 @@ struct ARViewContainer: UIViewRepresentable {
         private lazy var coinTemplate: ModelEntity = loadModelTemplate(named: "coin.usdz")
         private lazy var giftBoxTemplate: ModelEntity = loadModelTemplate(named: "giftBox.usdz")
         private lazy var hamburgerTemplate: ModelEntity = loadModelTemplate(named: "hamburger.usdz")
+        private lazy var sakuraTemplate: ModelEntity = loadModelTemplate(named: "sakura.usdz")
 
         private func template(for variant: PathCoinVariant) -> ModelEntity {
             switch variant {
             case .coin: return coinTemplate
             case .giftBox: return giftBoxTemplate
             case .hamburger: return hamburgerTemplate
+            case .sakura: return sakuraTemplate
             }
         }
 
@@ -320,8 +396,9 @@ struct ARViewContainer: UIViewRepresentable {
         private var lastRecordedPos: SIMD3<Float>?
         private let recordStep: Float = 0.12
 
-        // debug small spheres anchors
-        private var pathDebugAnchors: [AnchorEntity] = []
+        // debug small spheres (single root anchor -> faster clear)
+        private var pathDebugRoot: AnchorEntity?
+        private var pathDebugPoints: [ModelEntity] = []
         // debug markers for path coins
         private var pathCoinDebugAnchors: [AnchorEntity] = []
 
@@ -338,7 +415,7 @@ struct ARViewContainer: UIViewRepresentable {
         private let flowSpacing: Float = 0.22
         // “萤火虫簇”：一团虫群沿路径飞行（更像活物，不像画线）
         private let flowCount: Int = 10
-        private let flowSpeed: Float = 0.32            // 稍微快一点点
+        private let flowSpeed: Float = 0.50            // 稍微快一点点
         private let flowHeightOffset: Float = 0.22     // 更高一些，避免像“地面提示”
         private let flowSpriteSize: Float = 0.020      // 更小一点更像萤火虫
         private let flowSpriteAlpha: Float = 0.95
@@ -357,8 +434,7 @@ struct ARViewContainer: UIViewRepresentable {
         private let debugLogPathCoinSpawn: Bool = false
 
         // MARK: - Path gameplay params
-        private let warningDistance: Float = 0.25
-        private let deathDistance: Float = 0.5
+        // warning/death 由 UI 传入（可调 + 可关闭 death）
 
         // MARK: - Spawn visibility guard
         // 避免把币生成在相机“脸上/脚下”导致近裁剪：看不见但能碰到/能收集
@@ -391,12 +467,14 @@ struct ARViewContainer: UIViewRepresentable {
         // ✅ giftBox/hamburger 相对 coin 的尺寸（1 = 和 coin 一样大；0.25 = coin 的 1/4）
         private let giftBoxExtraScale: Float = 0.25
         private let hamburgerExtraScale: Float = 0.25
+        private let sakuraExtraScale: Float = 1.0
 
         private func extraScale(for variant: PathCoinVariant) -> Float {
             switch variant {
             case .coin: return 1.0
             case .giftBox: return giftBoxExtraScale
             case .hamburger: return hamburgerExtraScale
+            case .sakura: return sakuraExtraScale
             }
         }
 
@@ -444,8 +522,19 @@ struct ARViewContainer: UIViewRepresentable {
             }
         }
 
+        deinit {
+            // 兜底清理：避免 ARViewContainer 生命周期变化导致残留订阅/任务
+            updateSub?.cancel()
+            updateSub = nil
+            spawnTask?.cancel()
+            spawnTask = nil
+        }
+
         // MARK: - Recording tool
         private func startRecording() {
+            // 录制依赖 update loop，兜底确保订阅存在
+            startUpdateLoop()
+
             // 允许从 none 或 recorded 重新开始
             recordedPath.removeAll()
             lastRecordedPos = nil
@@ -483,16 +572,23 @@ struct ARViewContainer: UIViewRepresentable {
             let mesh = MeshResource.generateSphere(radius: 0.02)
             let mat = SimpleMaterial(color: .cyan, isMetallic: false)
             let e = ModelEntity(mesh: mesh, materials: [mat])
-
-            let a = AnchorEntity(world: pos)
-            a.addChild(e)
-            arView.scene.addAnchor(a)
-            pathDebugAnchors.append(a)
+            // 用一个 world root anchor 承载所有点，clear 时只删一个 anchor
+            if pathDebugRoot == nil {
+                let root = AnchorEntity(world: .zero)
+                arView.scene.addAnchor(root)
+                pathDebugRoot = root
+                pathDebugPoints.removeAll()
+            }
+            e.position = pos
+            pathDebugRoot?.addChild(e)
+            pathDebugPoints.append(e)
         }
 
         private func clearDebugPath() {
-            for a in pathDebugAnchors { a.removeFromParent() }
-            pathDebugAnchors.removeAll()
+            pathDebugPoints.forEach { $0.removeFromParent() }
+            pathDebugPoints.removeAll()
+            pathDebugRoot?.removeFromParent()
+            pathDebugRoot = nil
         }
 
         private func clearPathCoinDebugMarkers() {
@@ -845,7 +941,7 @@ struct ARViewContainer: UIViewRepresentable {
                     scale: targetScale * 1.06,
                     rotation: coin.transform.rotation,
                     translation: SIMD3<Float>(0, self.readyOvershootY, 0)
-                )
+                    )
                 coin.move(to: mid,
                           relativeTo: coin.parent,
                           duration: duration,
@@ -952,18 +1048,17 @@ struct ARViewContainer: UIViewRepresentable {
             }
 
             // ✅ 用单个 Task 顺序生成：不会一次性创建很多 timer，体感更“一个接一个”
-            spawnTask = Task { [weak self] in
-                guard let self else { return }
+            spawnTask = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard let arView = self.arView else { return }
+
+                // 先用“稀疏 raycast + 插值”预计算地面高度，减少每个 coin 都 raycast 的成本
+                let groundYs = self.precomputeGroundYs(for: spawnPoints, in: arView)
                 for (idx, p) in spawnPoints.enumerated() {
                     if Task.isCancelled { return }
                     // 稍微让出主线程，让 UI 有机会刷新（减少“点一下卡住”的感觉）
                     try? await Task.sleep(nanoseconds: UInt64(self.readySpawnInterval * 1_000_000_000))
-                    guard let arView = self.arView else { return }
-
-                    let camY = arView.session.currentFrame?.camera.transform.columns.3.y ?? p.y
-                    let groundY = self.findGroundY(near: p, cameraY: camY, in: arView)
-                    ?? self.lastGoodGroundY
-                    ?? p.y
+                    let groundY = (idx < groundYs.count) ? groundYs[idx] : p.y
 
                     let worldPos = SIMD3<Float>(p.x, groundY, p.z)
                     var tt = matrix_identity_float4x4
@@ -978,6 +1073,47 @@ struct ARViewContainer: UIViewRepresentable {
                 self.finalizeReadyAfter(delay: self.readyPopDuration + self.readyBounceDuration + 0.15)
                 self.spawnTask = nil
             }
+        }
+
+        // MARK: - Ground precompute (sparse raycast + interpolate)
+        @MainActor
+        private func precomputeGroundYs(for points: [SIMD3<Float>], in arView: ARView) -> [Float] {
+            guard !points.isEmpty else { return [] }
+
+            let n = points.count
+            var ys = Array(repeating: points[0].y, count: n)
+
+            // 控制最多 raycast 次数：路径越长越能省
+            let maxRaycasts = 18
+            let step = max(1, n / maxRaycasts)
+
+            var keyIndices: [Int] = Array(stride(from: 0, to: n, by: step))
+            if keyIndices.last != n - 1 { keyIndices.append(n - 1) }
+
+            var keyY: [Int: Float] = [:]
+            keyY.reserveCapacity(keyIndices.count)
+
+            for idx in keyIndices {
+                let p = points[idx]
+                let camY = arView.session.currentFrame?.camera.transform.columns.3.y ?? p.y
+                let y = self.findGroundY(near: p, cameraY: camY, in: arView) ?? self.lastGoodGroundY ?? p.y
+                keyY[idx] = y
+            }
+
+            // 线性插值填满
+            for i in 0..<keyIndices.count - 1 {
+                let a = keyIndices[i]
+                let b = keyIndices[i + 1]
+                let ya = keyY[a] ?? points[a].y
+                let yb = keyY[b] ?? points[b].y
+                let span = max(1, b - a)
+                for k in 0...span {
+                    let t = Float(k) / Float(span)
+                    ys[a + k] = ya + (yb - ya) * t
+                }
+            }
+
+            return ys
         }
 
         private func finalizeReadyAfter(delay: TimeInterval) {
@@ -1207,35 +1343,67 @@ struct ARViewContainer: UIViewRepresentable {
                 return
             }
 
+            let warn = max(0.05, warningDistance.wrappedValue)
+            let death = max(warn + 0.15, deathDistance.wrappedValue)
+            let allowDeath = deathEnabled.wrappedValue
+
+            // 速度优化：优先在上次最近点附近做窗口搜索；周期性做一次全量扫描防漂移
+            let n = recordedPath.count
+            if lastNearestPathIndex >= n { lastNearestPathIndex = max(0, n - 1) }
+
             var best: Float = .greatestFiniteMagnitude
-            for p in recordedPath {
+            var bestIdx: Int = lastNearestPathIndex
+
+            let doFull = (fullScanCooldown <= 0)
+            if doFull {
+                for i in 0..<n {
+                    let p = recordedPath[i]
                 let dx = camPos.x - p.x
                 let dz = camPos.z - p.z
                 let d = sqrt(dx*dx + dz*dz)
-                if d < best { best = d }
+                    if d < best {
+                        best = d
+                        bestIdx = i
+                    }
+                }
+                fullScanCooldown = fullScanEveryNFrames
+            } else {
+                let lo = max(0, lastNearestPathIndex - nearestSearchWindow)
+                let hi = min(n - 1, lastNearestPathIndex + nearestSearchWindow)
+                for i in lo...hi {
+                    let p = recordedPath[i]
+                    let dx = camPos.x - p.x
+                    let dz = camPos.z - p.z
+                    let d = sqrt(dx*dx + dz*dz)
+                    if d < best {
+                        best = d
+                        bestIdx = i
+                    }
+                }
+                fullScanCooldown -= 1
             }
+            lastNearestPathIndex = bestIdx
 
             let inGrace = (CACurrentMediaTime() - playStartedAt) < playGraceDuration
 
-            if best > deathDistance {
+            if best > death {
                 // 开局 grace：避免“刚开始就秒死”
-                if !inGrace {
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self else { return }
-                        self.mode.wrappedValue = .gameOver
-                        self.isWarning.wrappedValue = false
+                if allowDeath && !inGrace {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.mode.wrappedValue = .gameOver
+                    self.isWarning.wrappedValue = false
                         self.dangerLevel.wrappedValue = 0
                     }
                 }
-            } else {
-                // dangerLevel: 0..1 (warningDistance -> 0, deathDistance -> 1)
-                let t = (best - warningDistance) / max(0.0001, (deathDistance - warningDistance))
-                let clamped = max(0, min(1, t))
-                // smoothstep，让变化更“游戏化”、不突兀
-                let s = clamped * clamped * (3 - 2 * clamped)
-                dangerLevel.wrappedValue = s
-                isWarning.wrappedValue = (s > 0.001)
             }
+
+            // dangerLevel: 0..1 (warn -> 0, death -> 1)；death 关闭时也照样拉高紧张感，只是不判死
+            let t = (best - warn) / max(0.0001, (death - warn))
+            let clamped = max(0, min(1, t))
+            let s = clamped * clamped * (3 - 2 * clamped) // smoothstep
+            dangerLevel.wrappedValue = s
+            isWarning.wrappedValue = (s > 0.001)
         }
 
         // MARK: - Reset
@@ -1260,10 +1428,21 @@ struct ARViewContainer: UIViewRepresentable {
             recordedPath.removeAll()
             lastRecordedPos = nil
             lastGoodGroundY = nil
+            lastNearestPathIndex = 0
+            fullScanCooldown = 0
             pathStatus.wrappedValue = .none
 
             // clear anchors
             arView?.scene.anchors.removeAll()
+            // ARSession 也做一次彻底 reset：减少 tracking 残留/漂移导致的玄学 bug
+            if let arView {
+                let config = ARWorldTrackingConfiguration()
+                config.planeDetection = [.horizontal]
+                if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+                    config.sceneReconstruction = .mesh
+                }
+                arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+            }
 
             // ui state
             totalCoinsThisRun.wrappedValue = 0
@@ -1275,6 +1454,9 @@ struct ARViewContainer: UIViewRepresentable {
             // timers
             time = 0
             isPreparingLevel = false
+
+            // reset 后如果订阅曾经被取消，重新启动 update loop（不影响已存在的订阅）
+            startUpdateLoop()
         }
 
         // MARK: - Coin removal helpers

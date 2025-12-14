@@ -46,6 +46,12 @@ struct ContentView: View {
     // ✅ 新增：危险等级（0~1），用于更“游戏化”的紧张反馈
     @State private var dangerLevel: Float = 0
 
+    // ✅ 可调节的“路径容错”（不同场景：白线/马路牙子 vs 大马路）
+    @State private var warningDistance: Float = 0.6
+    @State private var deathDistance: Float = 1.2
+    @State private var deathEnabled: Bool = true
+    @State private var showPathTuning: Bool = true
+
     // Haptics task
     @State private var hapticTask: Task<Void, Never>?
     @StateObject private var heartbeat = HeartbeatController()
@@ -61,6 +67,9 @@ struct ContentView: View {
                 collectedCoins: $collectedCoins,
                 isWarning: $isWarning,
                 dangerLevel: $dangerLevel,
+                warningDistance: $warningDistance,
+                deathDistance: $deathDistance,
+                deathEnabled: $deathEnabled,
                 commands: $commands,
                 arReadyFinished: $arReadyFinished
             )
@@ -84,8 +93,13 @@ struct ContentView: View {
                 Spacer()
                 
                 // Bottom Controls
-                bottomControls
-                    .padding(.bottom, 30)
+                VStack(spacing: 12) {
+                    bottomControls
+                    if mode == .build {
+                        pathTuningPanel
+                    }
+                }
+                .padding(.bottom, 30)
             }
             .padding(.horizontal)
 
@@ -133,6 +147,19 @@ struct ContentView: View {
                 commands.startPlayToken = UUID()
             }
         }
+        // 保证 deathDistance >= warningDistance + 最小间隔
+        .onChange(of: warningDistance) { _, new in
+            let minGap: Float = 0.15
+            if deathDistance < new + minGap {
+                deathDistance = new + minGap
+            }
+        }
+        .onChange(of: deathDistance) { _, new in
+            let minGap: Float = 0.15
+            if new < warningDistance + minGap {
+                deathDistance = warningDistance + minGap
+            }
+        }
         // Haptics：dangerLevel 越高，震动越频繁
         .onChange(of: mode) { _, newMode in
             if newMode != .play {
@@ -167,6 +194,7 @@ struct ContentView: View {
             pathStatus = .none
             isWarning = false
             dangerLevel = 0
+            // 不重置 warning/death：让玩家的偏好保留
             collectedCoins = 0
             totalCoinsThisRun = 0
             showCelebration = false
@@ -527,6 +555,73 @@ extension ContentView {
             .disabled(pathStatus == .recording)
             .opacity(pathStatus == .recording ? 0.3 : 1.0)
         }
+    }
+
+    // MARK: - Path tuning panel (Build)
+    var pathTuningPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Path Tuning")
+                    .font(.system(.subheadline, design: .rounded).weight(.bold))
+                    .foregroundStyle(.white)
+                Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        showPathTuning.toggle()
+                    }
+                } label: {
+                    Image(systemName: showPathTuning ? "chevron.down" : "chevron.up")
+                        .foregroundStyle(.white.opacity(0.9))
+                }
+            }
+
+            if showPathTuning {
+                Toggle(isOn: $deathEnabled) {
+                    Text("Enable Death")
+                        .foregroundStyle(.white.opacity(0.95))
+                }
+                .toggleStyle(SwitchToggleStyle(tint: .red))
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Warning")
+                            .foregroundStyle(.white.opacity(0.95))
+                        Spacer()
+                        Text(String(format: "%.2fm", warningDistance))
+                            .foregroundStyle(.white.opacity(0.8))
+                            .font(.caption.monospacedDigit())
+                    }
+                    Slider(value: Binding(
+                        get: { Double(warningDistance) },
+                        set: { warningDistance = Float($0) }
+                    ), in: 0.2...2.0)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Death")
+                            .foregroundStyle(.white.opacity(0.95))
+                        Spacer()
+                        Text(String(format: "%.2fm", deathDistance))
+                            .foregroundStyle(.white.opacity(0.8))
+                            .font(.caption.monospacedDigit())
+                    }
+                    Slider(value: Binding(
+                        get: { Double(deathDistance) },
+                        set: { deathDistance = Float($0) }
+                    ), in: 0.3...3.5)
+                    Text(deathEnabled ? "Go out too far and you fail." : "No instant fail — just warning & tension.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+            }
+        }
+        .padding(14)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
     }
     
     var playControls: some View {
