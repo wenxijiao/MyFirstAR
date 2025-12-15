@@ -48,7 +48,9 @@ struct ARViewContainer: UIViewRepresentable {
         let arView = ARView(frame: .zero)
 
         // MARK: - AR Config
-        let config = makeSessionConfiguration()
+        // ✅ Build 阶段也需要更好的地形理解：启动时就启用 mesh（设备支持时）
+        // 为了不让用户看到“黑屏卡死”，我们会在 App 启动时先显示加载页（MyFirstARApp.swift）。
+        let config = makeSessionConfiguration(enableMesh: true)
         arView.session.run(config)
 
         // Lighting & Occlusion
@@ -59,6 +61,7 @@ struct ARViewContainer: UIViewRepresentable {
 
         // Gesture (build: tap to place coin)
         context.coordinator.arView = arView
+        context.coordinator.onARViewReady()
         let tap = UITapGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handleTap(_:)))
         arView.addGestureRecognizer(tap)
@@ -69,10 +72,11 @@ struct ARViewContainer: UIViewRepresentable {
         return arView
     }
 
-    private func makeSessionConfiguration() -> ARWorldTrackingConfiguration {
+    private func makeSessionConfiguration(enableMesh: Bool) -> ARWorldTrackingConfiguration {
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = [.horizontal]
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+        // 户外复杂地形（马路牙子/台阶）想要更可靠，需要 mesh（前提：设备支持 LiDAR）
+        if enableMesh, ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
             config.sceneReconstruction = .mesh
         }
         return config
@@ -130,11 +134,21 @@ struct ARViewContainer: UIViewRepresentable {
 
             super.init()
             setupAudioSession()
+        }
+
+        private var didPrewarm: Bool = false
+        // mesh 已在启动 session 时启用（设备支持时），无需再在 play 阶段重复 session.run
+        private var preloadCancellables: Set<AnyCancellable> = []
+        private var preloadedTemplates: [PathCoinVariant: ModelEntity] = [:]
+
+        // 典型“相机高度-地面高度”估计（raycast 全失败时兜底用）
+        private let assumedCameraHeight: Float = 1.3
+
+        func onARViewReady() {
             // 预热：避免第一次进 ready/play 时才加载资源导致卡顿
             prewarmOnce()
         }
 
-        private var didPrewarm: Bool = false
         private func prewarmOnce() {
             guard !didPrewarm else { return }
             didPrewarm = true
@@ -142,17 +156,35 @@ struct ARViewContainer: UIViewRepresentable {
             // 1) 预热音效池
             prepareSfxPoolIfNeeded()
 
-            // 2) 预热模型模板（触发 lazy load）
-            _ = coinTemplate
-            _ = giftBoxTemplate
-            _ = hamburgerTemplate
-            _ = sakuraTemplate
+            // 2) 模型异步并行预加载（避免在 init/首次访问时同步阻塞）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self else { return }
+                self.preloadModelAsync(variant: .coin, name: "coin.usdz")
+                self.preloadModelAsync(variant: .giftBox, name: "giftBox.usdz")
+                self.preloadModelAsync(variant: .hamburger, name: "hamburger.usdz")
+                self.preloadModelAsync(variant: .sakura, name: "sakura.usdz")
+            }
 
-            // 3) 预热缩放校准（需要 arView，在第一次拿到 arView 时做）
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            // 3) 预热缩放校准（需要 arView，稍后执行）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
                 guard let self, let arView = self.arView else { return }
                 self.calibratePathVariantScalesIfNeeded(in: arView)
             }
+        }
+
+        private func preloadModelAsync(variant: PathCoinVariant, name: String) {
+            // 已经有了就不重复
+            if preloadedTemplates[variant] != nil { return }
+
+            ModelEntity.loadModelAsync(named: name)
+                .sink { completion in
+                    if case let .failure(err) = completion {
+                        print("❌ Async preload failed:", name, err)
+                    }
+                } receiveValue: { [weak self] entity in
+                    self?.preloadedTemplates[variant] = entity
+                }
+                .store(in: &preloadCancellables)
         }
 
         // MARK: - Audio
@@ -245,6 +277,11 @@ struct ARViewContainer: UIViewRepresentable {
                 // 这里保持兼容：再保证一次
                 collectedCoins.wrappedValue = 0
                 playStartedAt = CACurrentMediaTime()
+                // ✅ Play 切入时先不上惩罚：等玩家捡到第一个“路径生成物”再开启警告/死亡判定
+                pathPenaltyArmed = false
+                pathVisualDangerLevel = 0
+
+                // mesh 已在启动时启用（设备支持时）
 
                 // play 开始：如果有路径就显示“能量流”，否则清理
                 if !recordedPath.isEmpty {
@@ -257,10 +294,14 @@ struct ARViewContainer: UIViewRepresentable {
             lastCommands = new
         }
 
+        // ensureMeshEnabledIfNeeded 已移除（避免重复 session.run 引发额外卡顿）
+
         // MARK: - World / coin storage
         private var coins: [ModelEntity] = []
         // 只记录“路径生成”的金币（Ready/Prepare 时会清理它们，但不影响手点金币）
         private var pathCoins: [ModelEntity] = []
+        // 追踪每个 coin 对应的 AnchorEntity，避免 reset 时全量 anchors.removeAll() 造成首轮大卡顿
+        private var coinAnchorById: [ObjectIdentifier: AnchorEntity] = [:]
         private var coinBaseY: [ObjectIdentifier: Float] = [:]
         private var coinPhase: [ObjectIdentifier: Float] = [:]
         private var attracting: Set<ObjectIdentifier> = []
@@ -291,6 +332,7 @@ struct ARViewContainer: UIViewRepresentable {
         private lazy var sakuraTemplate: ModelEntity = loadModelTemplate(named: "sakura.usdz")
 
         private func template(for variant: PathCoinVariant) -> ModelEntity {
+            if let t = preloadedTemplates[variant] { return t }
             switch variant {
             case .coin: return coinTemplate
             case .giftBox: return giftBoxTemplate
@@ -404,6 +446,8 @@ struct ARViewContainer: UIViewRepresentable {
 
         // MARK: - Path energy flow (sprite guide)
         private var flowAnchor: AnchorEntity?
+        // iOS17+ 粒子版：只用一个 emitter 实体模拟虫群（更轻量、更“官方”）
+        private var flowEmitterEntity: Entity?
         private var flowSprites: [ModelEntity] = []
         // swarm center cursor (single cluster moving along path)
         private var flowCenterCursor: Float = 0
@@ -415,7 +459,7 @@ struct ARViewContainer: UIViewRepresentable {
         private let flowSpacing: Float = 0.22
         // “萤火虫簇”：一团虫群沿路径飞行（更像活物，不像画线）
         private let flowCount: Int = 10
-        private let flowSpeed: Float = 0.50            // 稍微快一点点
+        private let flowSpeed: Float = 0.50            // 虫群整体沿路径移动速度：恢复到原来（刚刚好）
         private let flowHeightOffset: Float = 0.22     // 更高一些，避免像“地面提示”
         private let flowSpriteSize: Float = 0.020      // 更小一点更像萤火虫
         private let flowSpriteAlpha: Float = 0.95
@@ -428,6 +472,13 @@ struct ARViewContainer: UIViewRepresentable {
         private let flowSwarmLengthForward: Float = 0.26
         private let flowSwarmForwardJitter: Float = 0.14
         private let flowSwarmCohesion: Float = 0.18    // 越大越聚（用于轻微拉回）
+        // ✅ 路径提示：固定一群“虫群实体”（像之前小球一样），不要持续发射新粒子
+        private let flowUseParticleEmitter: Bool = false
+
+        // MARK: - Coin pop sparkle (lightweight particles)
+        private var sparkleAnchors: [AnchorEntity] = []
+        private let sparkleBurstCount: Int = 10
+        private let sparkleDuration: TimeInterval = 0.55
 
         // MARK: - Debug toggles
         private let debugShowPathCoinMarkers: Bool = false
@@ -610,7 +661,7 @@ struct ARViewContainer: UIViewRepresentable {
                 cg.addEllipse(in: circleRect.insetBy(dx: 1, dy: 1))
                 cg.clip()
 
-                // 中心白亮点更大一点，整体更明显
+                // 更柔和的 sprite：避免出现“硬边圆盘 + 中心点”
                 let colors = [
                     UIColor.white.withAlphaComponent(1.0).cgColor,
                     base.withAlphaComponent(0.95).cgColor,
@@ -628,6 +679,19 @@ struct ARViewContainer: UIViewRepresentable {
                                       options: [.drawsAfterEndLocation])
             }
             return img.cgImage
+        }
+
+        private func makeParticleSpriteTextureIfNeeded(name: String, size: Int, base: UIColor) -> TextureResource? {
+            // TextureResource 生成很小，但我们仍然缓存避免反复创建
+            guard let cg = Self.makeRadialSpriteCGImage(size: size, base: base) else { return nil }
+            // 你的 SDK 上 `TextureResource.generate(from:)` 可用，但提示 deprecated；
+            // 这里优先用新的 init（如果不可用编译器会提示，我再按你的 SDK 修）。
+            if #available(iOS 17.0, *) {
+                if let tex = try? TextureResource(image: cg, withName: name, options: .init(semantic: .color)) {
+                    return tex
+                }
+            }
+            return try? TextureResource.generate(from: cg, options: .init(semantic: .color))
         }
 
         private func randomFireflyBaseColor() -> UIColor {
@@ -670,6 +734,65 @@ struct ARViewContainer: UIViewRepresentable {
             arView.scene.addAnchor(a)
             flowAnchor = a
 
+            // iOS17+：用 RealityKit 粒子系统做“虫群”（更像萤火虫，也更省实体数量）
+            if #available(iOS 17.0, *), flowUseParticleEmitter {
+                let e = Entity()
+                e.position = flowSamples.first ?? .zero
+                a.addChild(e)
+                flowEmitterEntity = e
+
+                var emitter = ParticleEmitterComponent()
+                emitter.isEmitting = true
+                // ✅ 让粒子跟随虫群整体移动：避免“拖尾留在世界里”
+                // 这样可以把 birthRate 降得很低、lifeSpan 拉长，但仍然保持“一小团”随路径移动。
+                emitter.particlesInheritTransform = true
+                // 用“狭长盒子体积”而不是球面法线：更像虫群沿路飞，而不是朝四周炸开
+                emitter.emitterShape = .box
+                emitter.birthLocation = .volume
+                emitter.birthDirection = .normal
+                // 先在本地坐标系里设为“向前”，真正的 forward 由实体旋转对齐（updateFlowGuide 里每帧更新）
+                emitter.emissionDirection = SIMD3<Float>(0, 0.06, 1.0)
+                // ✅ 只调整“粒子本身”：更慢 + 生命周期更长（虫群整体移动速度不动）
+                emitter.speed = 0.0001
+                emitter.speedVariation = 0.00005
+
+                // 外观：用发光圆点 sprite（不需要额外素材）
+                let base = UIColor(red: 0.22, green: 1.00, blue: 0.85, alpha: 1.0)
+                if let tex = makeParticleSpriteTextureIfNeeded(name: "flow.firefly.sprite", size: 96, base: base) {
+                    emitter.mainEmitter.image = tex
+                }
+                // 更明显：更大 + additive 混合更“发光”
+                emitter.mainEmitter.blendMode = .additive
+                emitter.mainEmitter.size = max(0.016, flowSpriteSize * 0.82)
+                emitter.mainEmitter.sizeVariation = emitter.mainEmitter.size * 0.28
+                // 老粒子尽可能久：但因为粒子会跟随虫群移动，所以不会形成长拖尾
+                emitter.mainEmitter.lifeSpan = 3.00
+                emitter.mainEmitter.lifeSpanVariation = 0.35
+                // 少发射新粒子：更“省”、更舒服
+                emitter.mainEmitter.birthRate = Float(max(8, flowCount))
+                // 更紧：强阻尼 + 小扩散角
+                emitter.mainEmitter.dampingFactor = 1.25
+                emitter.mainEmitter.acceleration = SIMD3<Float>(0, 0.02, 0)
+                emitter.mainEmitter.spreadingAngle = .pi * 0.020
+                // 基本不用噪声：避免散开（保留一点点也行，但先保持最稳）
+                emitter.mainEmitter.noiseStrength = 0.0
+                emitter.mainEmitter.noiseScale = 1.25
+                emitter.mainEmitter.noiseAnimationSpeed = 0.0
+                // 回到默认淡入淡出（constant 会让 sprite “圆盘感”更重）
+                emitter.mainEmitter.opacityCurve = .quickFadeInOut
+                // 吸引力：强制聚拢到“前方小点”，让它看起来是一小团在飞
+                emitter.mainEmitter.attractionStrength = 2.4
+                emitter.mainEmitter.attractionCenter = SIMD3<Float>(0, 0.0, 0.35)
+
+                // 初始虫群体积：再聚拢一点（更“成团”）
+                emitter.emitterShapeSize = SIMD3<Float>(max(0.01, flowSwarmRadiusSide * 0.22),
+                                                       max(0.01, flowSwarmRadiusUp * 0.18),
+                                                       max(0.02, flowSwarmLengthForward * 0.35))
+
+                e.components.set(emitter)
+                return
+            }
+
             // 改成“发光小球”来保证一定可见（不依赖 alpha/纹理混合）
             let mesh = MeshResource.generateSphere(radius: flowSpriteSize * 0.45)
 
@@ -679,11 +802,14 @@ struct ARViewContainer: UIViewRepresentable {
             flowBaseOpacity.removeAll()
             flowPhaseA.removeAll()
             flowPhaseB.removeAll()
+            flowNormalColors.removeAll()
+            lastAppliedFlowAlarmQuant = -1
             flowSprites.reserveCapacity(flowCount)
             flowOffsets.reserveCapacity(flowCount)
             flowBaseOpacity.reserveCapacity(flowCount)
             flowPhaseA.reserveCapacity(flowCount)
             flowPhaseB.reserveCapacity(flowCount)
+            flowNormalColors.reserveCapacity(flowCount)
 
             // 让虫群从路径上的随机位置开始
             let maxIdx = Float(flowSamples.count - 1)
@@ -699,6 +825,7 @@ struct ARViewContainer: UIViewRepresentable {
                 e.position = SIMD3<Float>(repeating: 0)
                 a.addChild(e)
                 flowSprites.append(e)
+                flowNormalColors.append(baseColor)
 
                 // 初始随机分布在一个“椭球”内（狭长虫群）
                 let ox = Float.random(in: -1...1) * flowSwarmRadiusSide
@@ -715,9 +842,14 @@ struct ARViewContainer: UIViewRepresentable {
 
                 e.components.set(OpacityComponent(opacity: baseOpacity))
             }
+
+            // 初始外观：按照当前报警值刷一次（避免切回 play 时状态不同步）
+            applyFlowAlarmAppearanceIfNeeded()
         }
 
         private func clearFlowGuide() {
+            flowEmitterEntity?.removeFromParent()
+            flowEmitterEntity = nil
             flowSprites.forEach { $0.removeFromParent() }
             flowSprites.removeAll()
             flowCenterCursor = 0
@@ -726,8 +858,111 @@ struct ARViewContainer: UIViewRepresentable {
             flowBaseOpacity.removeAll()
             flowPhaseA.removeAll()
             flowPhaseB.removeAll()
+            flowNormalColors.removeAll()
+            lastAppliedFlowAlarmQuant = -1
             flowAnchor?.removeFromParent()
             flowAnchor = nil
+        }
+
+        private func clearSparkles() {
+            sparkleAnchors.forEach { $0.removeFromParent() }
+            sparkleAnchors.removeAll()
+        }
+
+        private func spawnSparkle(at worldPos: SIMD3<Float>) {
+            guard let arView else { return }
+
+            // 优先用 RealityKit 粒子组件（更好看、更像“魔法星尘”）
+            if #available(iOS 17.0, *) {
+                let anchor = AnchorEntity(world: worldPos)
+                arView.scene.addAnchor(anchor)
+                sparkleAnchors.append(anchor)
+
+                let emitterEntity = Entity()
+                anchor.addChild(emitterEntity)
+
+                // 你当前 SDK 的 ParticleEmitterComponent：没有 birthRate/lifetime/particle 这类顶层字段，
+                // 需要通过组件级别（burstCount/speed/shape）+ mainEmitter（lifeSpan/size/accel/噪声）来配置。
+                var emitter = ParticleEmitterComponent()
+                emitter.emitterShape = .point
+                emitter.birthLocation = .surface
+                emitter.birthDirection = .normal
+                emitter.emissionDirection = SIMD3<Float>(0, 1, 0)
+                emitter.speed = 0.55
+                emitter.speedVariation = 0.25
+
+                // 一次性“爆开”感觉：用 burstCount 来做短促星尘喷射
+                emitter.burstCount = 42
+                emitter.burstCountVariation = 18
+                emitter.isEmitting = true
+
+                // 主要外观/运动参数（颜色目前不走代码设置：用系统默认渐变；你要金色我可以再补一套贴图 sprite 方案）
+                emitter.mainEmitter.birthRate = 0 // burst 模式下基本不靠 birthRate
+                emitter.mainEmitter.lifeSpan = 0.55
+                emitter.mainEmitter.lifeSpanVariation = 0.18
+                emitter.mainEmitter.size = 0.012
+                emitter.mainEmitter.sizeVariation = 0.007
+                emitter.mainEmitter.sizeMultiplierAtEndOfLifespan = 0.05
+                emitter.mainEmitter.acceleration = SIMD3<Float>(0, -1.15, 0)
+                emitter.mainEmitter.spreadingAngle = .pi * 0.35
+                emitter.mainEmitter.dampingFactor = 0.22
+                emitter.mainEmitter.angularSpeed = 4.0
+                emitter.mainEmitter.angularSpeedVariation = 6.0
+                emitter.mainEmitter.noiseStrength = 0.28
+                emitter.mainEmitter.noiseScale = 1.15
+                emitter.mainEmitter.noiseAnimationSpeed = 0.65
+
+                // 关键：不给 image 的话，你这版 RealityKit 很可能“发射了但不可见”
+                let gold = UIColor(red: 1.0, green: 0.90, blue: 0.30, alpha: 1.0)
+                if let tex = makeParticleSpriteTextureIfNeeded(name: "sparkle.sprite", size: 96, base: gold) {
+                    emitter.mainEmitter.image = tex
+                }
+
+                emitterEntity.components.set(emitter)
+
+                // 自动清理
+                DispatchQueue.main.asyncAfter(deadline: .now() + sparkleDuration + 0.25) { [weak self] in
+                    anchor.removeFromParent()
+                    self?.sparkleAnchors.removeAll { $0 == anchor }
+                }
+            } else {
+                // 旧系统回退：用小球喷射（稳定但不如粒子精致）
+                spawnSparkleFallbackSpheres(at: worldPos)
+            }
+        }
+
+        private func spawnSparkleFallbackSpheres(at worldPos: SIMD3<Float>) {
+            guard let arView else { return }
+            guard sparkleBurstCount > 0 else { return }
+
+            let anchor = AnchorEntity(world: worldPos)
+            arView.scene.addAnchor(anchor)
+            sparkleAnchors.append(anchor)
+
+            let mesh = MeshResource.generateSphere(radius: 0.006)
+            var mat = UnlitMaterial()
+            mat.color = .init(tint: UIColor(red: 1.0, green: 0.92, blue: 0.35, alpha: 1.0))
+
+            for _ in 0..<sparkleBurstCount {
+                let e = ModelEntity(mesh: mesh, materials: [mat])
+                e.position = .zero
+                anchor.addChild(e)
+
+                let rx = Float.random(in: -0.10...0.10)
+                let rz = Float.random(in: -0.10...0.10)
+                let ry = Float.random(in: 0.06...0.18)
+                let end = Transform(
+                    scale: SIMD3<Float>(repeating: 0.001),
+                    rotation: e.transform.rotation,
+                    translation: SIMD3<Float>(rx, ry, rz)
+                )
+                e.move(to: end, relativeTo: anchor, duration: sparkleDuration, timingFunction: .easeOut)
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + sparkleDuration + 0.05) { [weak self] in
+                anchor.removeFromParent()
+                self?.sparkleAnchors.removeAll { $0 == anchor }
+            }
         }
 
         private func updateFlowGuide(deltaTime: TimeInterval) {
@@ -735,11 +970,74 @@ struct ARViewContainer: UIViewRepresentable {
             guard !recordedPath.isEmpty else { return }
             buildFlowGuideIfNeeded()
             guard let arView else { return }
-            guard flowSamples.count >= 2, flowSprites.count == flowOffsets.count, !flowSprites.isEmpty else { return }
+            guard flowSamples.count >= 2 else { return }
 
             guard let frame = arView.session.currentFrame else { return }
             let camT = frame.camera.transform
             let camPos = SIMD3<Float>(camT.columns.3.x, camT.columns.3.y, camT.columns.3.z)
+
+            // iOS17+ 粒子虫群版：只移动一个 emitter（避免一堆实体）
+            if #available(iOS 17.0, *), flowUseParticleEmitter, let e = flowEmitterEntity {
+                let dt = Float(deltaTime)
+                let advancePoints = (flowSpeed * dt) / max(1e-6, flowSpacing)
+                let maxIdx = Float(flowSamples.count - 1)
+
+                flowCenterCursor += advancePoints
+                if flowCenterCursor >= maxIdx { flowCenterCursor -= maxIdx }
+
+                let c = flowCenterCursor
+                let idx = Int(c)
+                let frac = c - Float(idx)
+                let p0 = flowSamples[idx]
+                let p1 = flowSamples[min(idx + 1, flowSamples.count - 1)]
+                let centerPos = p0 + (p1 - p0) * frac
+
+                var forward = SIMD3<Float>(p1.x - p0.x, 0, p1.z - p0.z)
+                if simd_length_squared(forward) < 1e-6 { forward = SIMD3<Float>(0, 0, -1) }
+                forward = simd_normalize(forward)
+
+                // 让 emitter 的“本地 +Z”对齐到路径 forward，这样 emissionDirection=(0,*,1) 就真的是“沿路飞”
+                let up = SIMD3<Float>(0, 1, 0)
+                var right = simd_cross(up, forward)
+                if simd_length_squared(right) < 1e-6 { right = SIMD3<Float>(1, 0, 0) }
+                right = simd_normalize(right)
+                let fwd = simd_normalize(simd_cross(right, up))
+                let rotM = simd_float3x3(columns: (right, up, fwd))
+                e.transform.rotation = simd_quatf(rotM)
+
+                // 危险越高越躁动
+                let danger = max(0, min(1, dangerLevel.wrappedValue))
+
+                e.position = centerPos
+                if var emitter = e.components[ParticleEmitterComponent.self] {
+                    emitter.particlesInheritTransform = true
+                    // 方向在本地空间，实体已旋转对齐 forward
+                    emitter.emissionDirection = SIMD3<Float>(0, 0.06 + 0.04 * danger, 1.0)
+                    // ✅ 只调粒子本身：发射更慢 + 生命周期更长
+                    emitter.speed = 0.10 + 0.03 * danger
+                    emitter.speedVariation = 0.02
+
+                    // iOS17+ 粒子虫群：不要“散开”逻辑，形状固定为很小一团
+                    emitter.emitterShapeSize = SIMD3<Float>(max(0.01, flowSwarmRadiusSide * 0.22),
+                                                           max(0.01, flowSwarmRadiusUp * 0.18),
+                                                           max(0.02, flowSwarmLengthForward * 0.35))
+
+                    // 更明显：危险时略多一点点即可
+                    // 少发射新粒子：危险时也只做非常轻微的加成
+                    emitter.mainEmitter.birthRate = Float(max(8, flowCount)) * (1.0 + 0.06 * danger)
+                    // 继续保持几乎无噪声（防止散开）
+                    emitter.mainEmitter.noiseStrength = 0.0
+                    emitter.mainEmitter.noiseAnimationSpeed = 0.0
+                    // 危险时更聚拢（但仍然是“前方小点”）
+                    emitter.mainEmitter.attractionStrength = 2.4 + 0.6 * danger
+                    emitter.mainEmitter.attractionCenter = SIMD3<Float>(0, 0.0, 0.35)
+                    e.components.set(emitter)
+                }
+                return
+            }
+
+            // 旧版（iOS17 以下）小球虫群
+            guard flowSprites.count == flowOffsets.count, !flowSprites.isEmpty else { return }
 
             let dt = Float(deltaTime)
             let advancePoints = (flowSpeed * dt) / max(1e-6, flowSpacing)
@@ -765,6 +1063,19 @@ struct ARViewContainer: UIViewRepresentable {
             if simd_length_squared(right) < 1e-6 { right = SIMD3<Float>(1, 0, 0) }
             right = simd_normalize(right)
 
+            // 交互：靠近玩家时散开
+            let dxC = camPos.x - centerPos.x
+            let dzC = camPos.z - centerPos.z
+            let distCenterXZ = sqrt(dxC*dxC + dzC*dzC)
+            let scatterStrength = max(0, min(1, (0.85 - distCenterXZ) / 0.85)) // 0..1
+
+            // ✅ 萤火虫“报警模式”：
+            // - 超过 warningDistance：立刻切成霓虹警示红/橙红
+            // - 偏离越远：闪烁越快（形成更强的“回到路径”引导）
+            let alarm = max(0, min(1, pathVisualDangerLevel))
+            let flickerSpeed = flowFlickerSpeed * (1.0 + 3.2 * alarm)
+            applyFlowAlarmAppearanceIfNeeded()
+
             for i in 0..<flowSprites.count {
                 // 轻微“群聚力”：把偏离的 offset 慢慢拉回
                 var o = flowOffsets[i]
@@ -779,6 +1090,12 @@ struct ARViewContainer: UIViewRepresentable {
                     cos(phb) * flowWobbleAmpXZ
                 )
                 o += flutter * dt
+
+                if scatterStrength > 0.001 {
+                    let outward = SIMD3<Float>(o.x, o.y * 0.7, o.z)
+                    let len = max(1e-4, simd_length(outward))
+                    o += (outward / len) * (0.18 * scatterStrength) * dt
+                }
 
                 // 前后方向再给一点 jitter，让群更“活”
                 let fJ = (sin(pha * 1.3) * 0.5 + 0.5) * flowSwarmForwardJitter
@@ -798,14 +1115,42 @@ struct ARViewContainer: UIViewRepresentable {
                 // 呼吸 + 闪烁
                 let pulsePhase = (Float(i) * 0.55) + time * 2.0
                 let pulse = (sin(pulsePhase) + 1) * 0.5
-                let flicker = (sin(flowPhaseB[i] + time * flowFlickerSpeed) + 1) * 0.5
+                let flicker = (sin(flowPhaseB[i] + time * flickerSpeed) + 1) * 0.5
                 let scale = 0.70 + 0.55 * pulse
-                let alpha = min(1.0, max(0.04, flowBaseOpacity[i] * (0.30 + 0.80 * flicker)))
+                let alpha = min(1.0, max(0.04, flowBaseOpacity[i] * (0.18 + (0.82 + 1.10 * alarm) * flicker)))
 
                 let sprite = flowSprites[i]
                 sprite.position = pos
                 sprite.scale = SIMD3<Float>(repeating: scale)
                 sprite.components.set(OpacityComponent(opacity: alpha))
+            }
+        }
+
+        // MARK: - Flow alarm appearance (color shift + cached updates)
+        private var flowNormalColors: [UIColor] = []
+        private var lastAppliedFlowAlarmQuant: Int = -1
+
+        private func applyFlowAlarmAppearanceIfNeeded() {
+            guard !flowSprites.isEmpty else { return }
+            guard flowSprites.count == flowNormalColors.count else { return }
+
+            let alarm = max(0, min(1, pathVisualDangerLevel))
+            // 超过 warningDistance：立刻切红（pathVisualDangerLevel > 0）
+            let isAlarmOn = (alarm > 0.001)
+            // 量化：只做 0/1 两态，避免每帧改材质（材质写入开销更大）
+            let quant = isAlarmOn ? 1 : 0
+            guard quant != lastAppliedFlowAlarmQuant else { return }
+            lastAppliedFlowAlarmQuant = quant
+
+            for i in 0..<flowSprites.count {
+                let base = flowNormalColors[i]
+                // 霓虹警示红/橙红（更“刺”一点，但仍然干净）
+                let alarmNeon = UIColor(red: 1.0, green: 0.33, blue: 0.05, alpha: 1.0)
+                let tint = isAlarmOn ? alarmNeon : base
+                let e = flowSprites[i]
+                guard var mat = e.model?.materials.first as? UnlitMaterial else { continue }
+                mat.color = .init(tint: tint.withAlphaComponent(1.0))
+                e.model?.materials = [mat]
             }
         }
 
@@ -916,6 +1261,8 @@ struct ARViewContainer: UIViewRepresentable {
             coins.append(coin)
             if isPathCoin { pathCoins.append(coin) }
             let id = ObjectIdentifier(coin)
+            coinAnchorById[id] = anchor
+            isPathCoinById[id] = isPathCoin
             coinBaseY[id] = coin.position.y
             coinPhase[id] = Float.random(in: 0..<(2 * .pi))
 
@@ -935,6 +1282,10 @@ struct ARViewContainer: UIViewRepresentable {
             appearing.insert(id)
             DispatchQueue.main.asyncAfter(deadline: .now() + appearDelay) { [weak self] in
                 guard let self else { return }
+
+                // 粒子：在地面位置喷一下
+                let groundPos = SIMD3<Float>(pos.x, pos.y - self.coinGroundOffsetY, pos.z)
+                self.spawnSparkle(at: groundPos)
 
                 // 1) 上冲 + 轻微过冲（更生动）
                 let mid = Transform(
@@ -979,6 +1330,9 @@ struct ARViewContainer: UIViewRepresentable {
             lastGoodGroundY = nil
             spawnTask?.cancel()
             spawnTask = nil
+            // ✅ 新一轮准备：惩罚逻辑重新上锁（等玩家捡到第一个路径生成物才开始判定）
+            pathPenaltyArmed = false
+            pathVisualDangerLevel = 0
 
             // 1) mode 进入 ready（UI 已经先切了，这里保证一致）
             mode.wrappedValue = .ready
@@ -1096,7 +1450,8 @@ struct ARViewContainer: UIViewRepresentable {
             for idx in keyIndices {
                 let p = points[idx]
                 let camY = arView.session.currentFrame?.camera.transform.columns.3.y ?? p.y
-                let y = self.findGroundY(near: p, cameraY: camY, in: arView) ?? self.lastGoodGroundY ?? p.y
+                let fallback = self.lastGoodGroundY ?? (camY - self.assumedCameraHeight)
+                let y = self.findGroundY(near: p, cameraY: camY, in: arView) ?? fallback
                 keyY[idx] = y
             }
 
@@ -1313,11 +1668,19 @@ struct ARViewContainer: UIViewRepresentable {
                 guard let self else { return }
 
                 let oid = ObjectIdentifier(coin)
+                let wasPathCoin = (self.isPathCoinById[oid] == true)
                 // ⚠️ 这里不能用 index 删除：异步期间 coins 可能已变化，导致误删
                 self.removeCoinEverywhere(oid: oid)
 
                 self.collectedCoins.wrappedValue += 1
                 self.playCoinSound()
+
+                // ✅ 惩罚逻辑（警告/死亡）解锁：玩家收集到第一个“路径生成物”后才开始
+                if wasPathCoin, !self.pathPenaltyArmed {
+                    self.pathPenaltyArmed = true
+                    // 给一个新的 grace：避免“刚解锁就瞬间触发警告/判死”
+                    self.playStartedAt = CACurrentMediaTime()
+                }
 
                 // 通关判定：收集完 -> result
                 if self.collectedCoins.wrappedValue >= self.totalCoinsThisRun.wrappedValue,
@@ -1384,26 +1747,36 @@ struct ARViewContainer: UIViewRepresentable {
             }
             lastNearestPathIndex = bestIdx
 
+            // 先计算一个“可视化报警值”：即便惩罚没开，也能让萤火虫变红并加速闪烁来引导回路径
+            let t = (best - warn) / max(0.0001, (death - warn))
+            let clamped = max(0, min(1, t))
+            let visual = clamped * clamped * (3 - 2 * clamped) // smoothstep
+            pathVisualDangerLevel = visual
+
+            // ✅ 惩罚逻辑（警告/死亡）只有在“收集到第一个路径生成物”后才开始
+            guard pathPenaltyArmed else {
+                isWarning.wrappedValue = false
+                dangerLevel.wrappedValue = 0
+                return
+            }
+
             let inGrace = (CACurrentMediaTime() - playStartedAt) < playGraceDuration
 
             if best > death {
-                // 开局 grace：避免“刚开始就秒死”
+                // grace：避免“刚解锁就秒死”
                 if allowDeath && !inGrace {
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.mode.wrappedValue = .gameOver
-                    self.isWarning.wrappedValue = false
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.mode.wrappedValue = .gameOver
+                        self.isWarning.wrappedValue = false
                         self.dangerLevel.wrappedValue = 0
                     }
                 }
             }
 
             // dangerLevel: 0..1 (warn -> 0, death -> 1)；death 关闭时也照样拉高紧张感，只是不判死
-            let t = (best - warn) / max(0.0001, (death - warn))
-            let clamped = max(0, min(1, t))
-            let s = clamped * clamped * (3 - 2 * clamped) // smoothstep
-            dangerLevel.wrappedValue = s
-            isWarning.wrappedValue = (s > 0.001)
+            dangerLevel.wrappedValue = visual
+            isWarning.wrappedValue = (visual > 0.001)
         }
 
         // MARK: - Reset
@@ -1414,11 +1787,14 @@ struct ARViewContainer: UIViewRepresentable {
             for c in coins { c.removeFromParent() }
             coins.removeAll()
             pathCoins.removeAll()
+            for a in coinAnchorById.values { a.removeFromParent() }
+            coinAnchorById.removeAll()
             coinBaseY.removeAll()
             coinPhase.removeAll()
             attracting.removeAll()
             appearing.removeAll()
             clearFlowGuide()
+            clearSparkles()
 
             // remove debug path
             clearDebugPath()
@@ -1432,17 +1808,8 @@ struct ARViewContainer: UIViewRepresentable {
             fullScanCooldown = 0
             pathStatus.wrappedValue = .none
 
-            // clear anchors
-            arView?.scene.anchors.removeAll()
-            // ARSession 也做一次彻底 reset：减少 tracking 残留/漂移导致的玄学 bug
-            if let arView {
-                let config = ARWorldTrackingConfiguration()
-                config.planeDetection = [.horizontal]
-                if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-                    config.sceneReconstruction = .mesh
-                }
-                arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-            }
+            // 不再在 reset 时 session.run + scene.anchors.removeAll：
+            // 这是首轮“完全卡住几秒”的常见来源之一。我们已精确移除自己创建的 anchors，ARSession 继续跑即可。
 
             // ui state
             totalCoinsThisRun.wrappedValue = 0
@@ -1454,6 +1821,9 @@ struct ARViewContainer: UIViewRepresentable {
             // timers
             time = 0
             isPreparingLevel = false
+            pathPenaltyArmed = false
+            pathVisualDangerLevel = 0
+            isPathCoinById.removeAll()
 
             // reset 后如果订阅曾经被取消，重新启动 update loop（不影响已存在的订阅）
             startUpdateLoop()
@@ -1477,6 +1847,9 @@ struct ARViewContainer: UIViewRepresentable {
             if let coin = coins.first(where: { ObjectIdentifier($0) == oid }) {
                 coin.removeFromParent()
             }
+            if let a = coinAnchorById.removeValue(forKey: oid) {
+                a.removeFromParent()
+            }
 
             // 再从各容器移除引用
             coins.removeAll { ObjectIdentifier($0) == oid }
@@ -1485,6 +1858,15 @@ struct ARViewContainer: UIViewRepresentable {
             coinPhase.removeValue(forKey: oid)
             attracting.remove(oid)
             appearing.remove(oid)
+            isPathCoinById.removeValue(forKey: oid)
         }
+
+        // MARK: - Path penalty gating + visual alarm
+        // 惩罚（警告/死亡）是否已解锁：玩家收集到第一个“路径生成物”后才开始判定
+        private var pathPenaltyArmed: Bool = false
+        // 用于“萤火虫报警模式”的可视化危险值（0~1）；不依赖是否解锁惩罚
+        private var pathVisualDangerLevel: Float = 0
+        // 记录每个 coin 是否为路径生成物（用于解锁惩罚）
+        private var isPathCoinById: [ObjectIdentifier: Bool] = [:]
     }
 }

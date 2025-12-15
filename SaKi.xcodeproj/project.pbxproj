@@ -7,13 +7,13 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		BF419A1C2EECCE3600F9A9E7 /* MyFirstAR.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MyFirstAR.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		BF419A1C2EECCE3600F9A9E7 /* SaKi.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SaKi.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		BF419A1E2EECCE3600F9A9E7 /* MyFirstAR */ = {
+		BF419A1E2EECCE3600F9A9E7 /* SaKi */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = MyFirstAR;
+			path = SaKi;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -32,7 +32,7 @@
 		BF419A132EECCE3600F9A9E7 = {
 			isa = PBXGroup;
 			children = (
-				BF419A1E2EECCE3600F9A9E7 /* MyFirstAR */,
+				BF419A1E2EECCE3600F9A9E7 /* SaKi */,
 				BF419A1D2EECCE3600F9A9E7 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -40,7 +40,7 @@
 		BF419A1D2EECCE3600F9A9E7 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				BF419A1C2EECCE3600F9A9E7 /* MyFirstAR.app */,
+				BF419A1C2EECCE3600F9A9E7 /* SaKi.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -48,9 +48,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		BF419A1B2EECCE3600F9A9E7 /* MyFirstAR */ = {
+		BF419A1B2EECCE3600F9A9E7 /* SaKi */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = BF419A272EECCE3700F9A9E7 /* Build configuration list for PBXNativeTarget "MyFirstAR" */;
+			buildConfigurationList = BF419A272EECCE3700F9A9E7 /* Build configuration list for PBXNativeTarget "SaKi" */;
 			buildPhases = (
 				BF419A182EECCE3600F9A9E7 /* Sources */,
 				BF419A192EECCE3600F9A9E7 /* Frameworks */,
@@ -61,13 +61,13 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				BF419A1E2EECCE3600F9A9E7 /* MyFirstAR */,
+				BF419A1E2EECCE3600F9A9E7 /* SaKi */,
 			);
-			name = MyFirstAR;
+			name = SaKi;
 			packageProductDependencies = (
 			);
 			productName = MyFirstAR;
-			productReference = BF419A1C2EECCE3600F9A9E7 /* MyFirstAR.app */;
+			productReference = BF419A1C2EECCE3600F9A9E7 /* SaKi.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -85,7 +85,7 @@
 					};
 				};
 			};
-			buildConfigurationList = BF419A172EECCE3600F9A9E7 /* Build configuration list for PBXProject "MyFirstAR" */;
+			buildConfigurationList = BF419A172EECCE3600F9A9E7 /* Build configuration list for PBXProject "SaKi" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -99,7 +99,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				BF419A1B2EECCE3600F9A9E7 /* MyFirstAR */,
+				BF419A1B2EECCE3600F9A9E7 /* SaKi */,
 			);
 		};
 /* End PBXProject section */
@@ -256,7 +256,8 @@
 				DEVELOPMENT_TEAM = F9P4MCQ54J;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "Needed for AR functions";
+				INFOPLIST_KEY_CFBundleDisplayName = SaKi;
+				INFOPLIST_KEY_NSCameraUsageDescription = "This app uses the camera for AR gameplay.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -267,7 +268,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vincent.MyFirstAR;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vincent.SaKi;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -289,7 +290,8 @@
 				DEVELOPMENT_TEAM = F9P4MCQ54J;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "Needed for AR functions";
+				INFOPLIST_KEY_CFBundleDisplayName = SaKi;
+				INFOPLIST_KEY_NSCameraUsageDescription = "This app uses the camera for AR gameplay.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -300,7 +302,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vincent.MyFirstAR;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vincent.SaKi;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -315,7 +317,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		BF419A172EECCE3600F9A9E7 /* Build configuration list for PBXProject "MyFirstAR" */ = {
+		BF419A172EECCE3600F9A9E7 /* Build configuration list for PBXProject "SaKi" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				BF419A252EECCE3700F9A9E7 /* Debug */,
@@ -324,7 +326,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		BF419A272EECCE3700F9A9E7 /* Build configuration list for PBXNativeTarget "MyFirstAR" */ = {
+		BF419A272EECCE3700F9A9E7 /* Build configuration list for PBXNativeTarget "SaKi" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				BF419A282EECCE3700F9A9E7 /* Debug */,

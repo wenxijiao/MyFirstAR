@@ -50,7 +50,8 @@ struct ContentView: View {
     @State private var warningDistance: Float = 0.6
     @State private var deathDistance: Float = 1.2
     @State private var deathEnabled: Bool = true
-    @State private var showPathTuning: Bool = true
+    // 默认折叠，避免一打开就占屏
+    @State private var showPathTuning: Bool = false
 
     // Haptics task
     @State private var hapticTask: Task<Void, Never>?
@@ -138,6 +139,10 @@ struct ContentView: View {
                 }
                 .transition(.scale)
             }
+        }
+        .onAppear {
+            // 启动时预热 heartbeat，避免第一次进入危险/结束时才创建 AVAudioPlayer 引发卡顿
+            heartbeat.prewarm()
         }
         // 监听 AR 准备完成 (动画播放完毕)
         .onChange(of: arReadyFinished) { _, finished in
@@ -300,6 +305,11 @@ private struct DangerEdgePulseOverlay: View {
 private final class HeartbeatController: ObservableObject {
     private var player: AVAudioPlayer?
     private var lastApplied: Double = -1
+
+    func prewarm() {
+        ensurePlayer()
+        player?.prepareToPlay()
+    }
 
     func apply(level: Double) {
         let l = max(0, min(1, level))
@@ -570,7 +580,7 @@ extension ContentView {
                         showPathTuning.toggle()
                     }
                 } label: {
-                    Image(systemName: showPathTuning ? "chevron.down" : "chevron.up")
+                    Image(systemName: showPathTuning ? "chevron.down" : "chevron.right")
                         .foregroundStyle(.white.opacity(0.9))
                 }
             }
