@@ -26,6 +26,7 @@ struct ARViewContainer: UIViewRepresentable {
     @Binding var deathDistance: Float
     @Binding var deathEnabled: Bool
     @Binding var pathPenaltyArmed: Bool
+    @Binding var buildSpawnItem: BuildSpawnItem
     @Binding var commands: ARCommands
     @Binding var arReadyFinished: Bool
 
@@ -41,6 +42,7 @@ struct ARViewContainer: UIViewRepresentable {
             deathDistance: $deathDistance,
             deathEnabled: $deathEnabled,
             pathPenaltyArmed: $pathPenaltyArmed,
+            buildSpawnItem: $buildSpawnItem,
             commands: $commands,
             arReadyFinished: $arReadyFinished
         )
@@ -104,6 +106,7 @@ struct ARViewContainer: UIViewRepresentable {
         private let deathDistance: Binding<Float>
         private let deathEnabled: Binding<Bool>
         private let pathPenaltyArmed: Binding<Bool>
+        private let buildSpawnItem: Binding<BuildSpawnItem>
         private let commands: Binding<ARCommands>
         private let arReadyFinished: Binding<Bool>
 
@@ -117,6 +120,7 @@ struct ARViewContainer: UIViewRepresentable {
              deathDistance: Binding<Float>,
              deathEnabled: Binding<Bool>,
              pathPenaltyArmed: Binding<Bool>,
+             buildSpawnItem: Binding<BuildSpawnItem>,
              commands: Binding<ARCommands>,
              arReadyFinished: Binding<Bool>) {
 
@@ -130,6 +134,7 @@ struct ARViewContainer: UIViewRepresentable {
             self.deathDistance = deathDistance
             self.deathEnabled = deathEnabled
             self.pathPenaltyArmed = pathPenaltyArmed
+            self.buildSpawnItem = buildSpawnItem
             self.commands = commands
             self.arReadyFinished = arReadyFinished
             // ✅ 关键：避免第一次 updateUIView 时把所有 token 都当成“变化”
@@ -168,6 +173,9 @@ struct ARViewContainer: UIViewRepresentable {
                 self.preloadModelAsync(variant: .giftBox, name: "giftBox.usdz")
                 self.preloadModelAsync(variant: .hamburger, name: "hamburger.usdz")
                 self.preloadModelAsync(variant: .sakura, name: "sakura.usdz")
+                self.preloadModelAsync(variant: .christmasBall, name: "christmas_ball.usdz")
+                self.preloadModelAsync(variant: .christmasTree, name: "christmas_tree.usdz")
+                self.preloadModelAsync(variant: .gingerbreadWagon, name: "gingerbread_wagon.usdz")
             }
 
             // 3) 预热缩放校准（需要 arView，稍后执行）
@@ -201,6 +209,86 @@ struct ARViewContainer: UIViewRepresentable {
             } catch {
                 print("❌ AudioSession error:", error)
             }
+        }
+
+        // MARK: - Background Music (BGM)
+        private var bgmPlayer: AVAudioPlayer?
+        private var bgmFadeTimer: Timer?
+        private var bgmURLs: [URL] = []
+
+        private func loadBgmURLsIfNeeded() {
+            if !bgmURLs.isEmpty { return }
+            // Files are placed under "BGM/" in the app bundle.
+            // Note: if you added them as a group (yellow folder) instead of folder reference (blue folder),
+            // the files may end up in the bundle root (subdirectory lookup will fail). Support both.
+            let inSubdir = Bundle.main.urls(forResourcesWithExtension: "mp3", subdirectory: "BGM") ?? []
+            let inRoot = Bundle.main.urls(forResourcesWithExtension: "mp3", subdirectory: nil) ?? []
+
+            // Prefer subdir; fallback to root. Filter to our naming to avoid catching heartbeat.mp3 etc.
+            let all = (inSubdir.isEmpty ? inRoot : inSubdir)
+            bgmURLs = all.filter { $0.lastPathComponent.lowercased().hasPrefix("music") }
+
+            if bgmURLs.isEmpty {
+                print("⚠️ No BGM files found in bundle. Make sure BGM/*.mp3 are added to Target Membership and Copy Bundle Resources.")
+            }
+        }
+
+        private func startRandomBgmIfNeeded() {
+            loadBgmURLsIfNeeded()
+            guard !bgmURLs.isEmpty else { return }
+
+            // If already playing, keep current track (avoid re-roll on repeated tokens)
+            if let p = bgmPlayer, p.isPlaying { return }
+
+            guard let url = bgmURLs.randomElement() else { return }
+            do {
+                let p = try AVAudioPlayer(contentsOf: url)
+                p.numberOfLoops = -1
+                p.volume = 0.0
+                p.prepareToPlay()
+                bgmPlayer = p
+                p.play()
+                fadeBgm(to: 0.28, duration: 1.2)
+            } catch {
+                print("❌ BGM player error:", error)
+                bgmPlayer = nil
+            }
+        }
+
+        private func fadeOutAndStopBgm(duration: TimeInterval = 0.9) {
+            guard bgmPlayer != nil else { return }
+            fadeBgm(to: 0.0, duration: duration) { [weak self] in
+                self?.bgmPlayer?.stop()
+                self?.bgmPlayer = nil
+            }
+        }
+
+        private func fadeBgm(to target: Float, duration: TimeInterval, completion: (() -> Void)? = nil) {
+            bgmFadeTimer?.invalidate()
+            bgmFadeTimer = nil
+            guard let p = bgmPlayer else { completion?(); return }
+
+            let start = p.volume
+            let end = max(0, min(1, target))
+            let steps = max(1, Int(duration / (1.0 / 30.0)))
+            var i = 0
+
+            bgmFadeTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] t in
+                guard let self else { t.invalidate(); return }
+                guard let p2 = self.bgmPlayer else { t.invalidate(); return }
+                i += 1
+                let tt = Float(i) / Float(steps)
+                // smoothstep
+                let s = tt * tt * (3 - 2 * tt)
+                p2.volume = start + (end - start) * s
+                if i >= steps {
+                    p2.volume = end
+                    t.invalidate()
+                    self.bgmFadeTimer = nil
+                    completion?()
+                }
+            }
+            RunLoop.main.add(bgmFadeTimer!, forMode: .common)
         }
 
         private let soundName = "coin"
@@ -261,6 +349,8 @@ struct ARViewContainer: UIViewRepresentable {
         func handleCommands(_ new: ARCommands) {
 
             if new.resetToken != lastCommands.resetToken {
+                // New run: fade out BGM
+                fadeOutAndStopBgm(duration: 0.9)
                 resetAll()
             }
 
@@ -295,6 +385,9 @@ struct ARViewContainer: UIViewRepresentable {
                 } else {
                     clearFlowGuide()
                 }
+
+                // Start random BGM when gameplay starts
+                startRandomBgmIfNeeded()
             }
 
             lastCommands = new
@@ -320,6 +413,9 @@ struct ARViewContainer: UIViewRepresentable {
             case giftBox
             case hamburger
             case sakura
+            case christmasBall
+            case christmasTree
+            case gingerbreadWagon
 
             var modelName: String {
                 switch self {
@@ -327,6 +423,9 @@ struct ARViewContainer: UIViewRepresentable {
                 case .giftBox: return "giftBox.usdz"
                 case .hamburger: return "hamburger.usdz"
                 case .sakura: return "sakura.usdz"
+                case .christmasBall: return "christmas_ball.usdz"
+                case .christmasTree: return "christmas_tree.usdz"
+                case .gingerbreadWagon: return "gingerbread_wagon.usdz"
                 }
             }
         }
@@ -336,6 +435,9 @@ struct ARViewContainer: UIViewRepresentable {
         private lazy var giftBoxTemplate: ModelEntity = loadModelTemplate(named: "giftBox.usdz")
         private lazy var hamburgerTemplate: ModelEntity = loadModelTemplate(named: "hamburger.usdz")
         private lazy var sakuraTemplate: ModelEntity = loadModelTemplate(named: "sakura.usdz")
+        private lazy var christmasBallTemplate: ModelEntity = loadModelTemplate(named: "christmas_ball.usdz")
+        private lazy var christmasTreeTemplate: ModelEntity = loadModelTemplate(named: "christmas_tree.usdz")
+        private lazy var gingerbreadWagonTemplate: ModelEntity = loadModelTemplate(named: "gingerbread_wagon.usdz")
 
         private func template(for variant: PathCoinVariant) -> ModelEntity {
             if let t = preloadedTemplates[variant] { return t }
@@ -344,6 +446,9 @@ struct ARViewContainer: UIViewRepresentable {
             case .giftBox: return giftBoxTemplate
             case .hamburger: return hamburgerTemplate
             case .sakura: return sakuraTemplate
+            case .christmasBall: return christmasBallTemplate
+            case .christmasTree: return christmasTreeTemplate
+            case .gingerbreadWagon: return gingerbreadWagonTemplate
             }
         }
 
@@ -544,6 +649,9 @@ struct ARViewContainer: UIViewRepresentable {
         private let giftBoxExtraScale: Float = 0.25
         private let hamburgerExtraScale: Float = 0.25
         private let sakuraExtraScale: Float = 1.0
+        private let christmasBallExtraScale: Float = 0.35
+        private let christmasTreeExtraScale: Float = 0.55
+        private let gingerbreadWagonExtraScale: Float = 2.0
 
         private func extraScale(for variant: PathCoinVariant) -> Float {
             switch variant {
@@ -551,6 +659,9 @@ struct ARViewContainer: UIViewRepresentable {
             case .giftBox: return giftBoxExtraScale
             case .hamburger: return hamburgerExtraScale
             case .sakura: return sakuraExtraScale
+            case .christmasBall: return christmasBallExtraScale
+            case .christmasTree: return christmasTreeExtraScale
+            case .gingerbreadWagon: return gingerbreadWagonExtraScale
             }
         }
 
@@ -569,7 +680,12 @@ struct ARViewContainer: UIViewRepresentable {
                                          alignment: .horizontal)
             guard let hit = results.first else { return }
 
-            placeCoin(at: hit.worldTransform, withAppear: false, appearDelay: 0)
+            let chosen = buildSpawnItem.wrappedValue
+            placeCoin(at: hit.worldTransform,
+                      withAppear: false,
+                      appearDelay: 0,
+                      isPathCoin: false,
+                      buildOverride: chosen)
         }
 
         // MARK: - Update Loop
@@ -1391,7 +1507,8 @@ struct ARViewContainer: UIViewRepresentable {
         private func placeCoin(at worldTransform: simd_float4x4,
                                withAppear: Bool,
                                appearDelay: TimeInterval,
-                               isPathCoin: Bool = false) {
+                               isPathCoin: Bool = false,
+                               buildOverride: BuildSpawnItem? = nil) {
 
             guard let arView else { return }
 
@@ -1427,9 +1544,23 @@ struct ARViewContainer: UIViewRepresentable {
                     let s = calibratedPathScale[v] ?? (pathCoinScale * extraScale(for: v))
                     targetScale = SIMD3<Float>(repeating: s)
                 } else {
-                    coin = coinTemplate.clone(recursive: true)
-                    configureCoinMaterial(coin, forPathCoin: false)
-                    targetScale = SIMD3<Float>(repeating: buildCoinScale)
+                    let selected = buildOverride ?? .coin
+                    let v: PathCoinVariant
+                    switch selected {
+                    case .coin: v = .coin
+                    case .giftBox: v = .giftBox
+                    case .hamburger: v = .hamburger
+                    case .sakura: v = .sakura
+                    case .christmasBall: v = .christmasBall
+                    case .christmasTree: v = .christmasTree
+                    case .gingerbreadWagon: v = .gingerbreadWagon
+                    }
+                    coin = template(for: v).clone(recursive: true)
+                    // 只对 coin 做“金币材质”处理，其它保持原贴图/材质
+                    if v == .coin { configureCoinMaterial(coin, forPathCoin: false) }
+                    calibratePathVariantScalesIfNeeded(in: arView)
+                    let s = calibratedPathScale[v] ?? (buildCoinScale * extraScale(for: v))
+                    targetScale = SIMD3<Float>(repeating: s)
                 }
             }
 

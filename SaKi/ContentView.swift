@@ -25,6 +25,56 @@ enum PathStatus: Equatable {
     case recorded       // 已录制
 }
 
+// MARK: - Build spawn selection (what to place when tapping in Build mode)
+enum BuildSpawnItem: String, CaseIterable, Identifiable, Equatable {
+    case coin
+    case giftBox
+    case hamburger
+    case sakura
+    case christmasBall
+    case christmasTree
+    case gingerbreadWagon
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .coin: return "Coin"
+        case .giftBox: return "Gift Box"
+        case .hamburger: return "Hamburger"
+        case .sakura: return "Sakura"
+        case .christmasBall: return "Christmas Ball"
+        case .christmasTree: return "Christmas Tree"
+        case .gingerbreadWagon: return "Gingerbread Wagon"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .coin: return "circle.hexagongrid.fill"
+        case .giftBox: return "gift.fill"
+        case .hamburger: return "fork.knife"
+        case .sakura: return "leaf.fill"
+        case .christmasBall: return "circle.fill"
+        case .christmasTree: return "tree.fill"
+        case .gingerbreadWagon: return "cart.fill"
+        }
+    }
+
+    /// Must match the USDZ names in bundle
+    var modelName: String {
+        switch self {
+        case .coin: return "coin.usdz"
+        case .giftBox: return "giftBox.usdz"
+        case .hamburger: return "hamburger.usdz"
+        case .sakura: return "sakura.usdz"
+        case .christmasBall: return "christmas_ball.usdz"
+        case .christmasTree: return "christmas_tree.usdz"
+        case .gingerbreadWagon: return "gingerbread_wagon.usdz"
+        }
+    }
+}
+
 struct ARCommands: Equatable {
     var resetToken: UUID = UUID()
     var startRecordingToken: UUID = UUID()
@@ -46,6 +96,9 @@ struct ContentView: View {
 
     // First-run tips (only show once)
     @AppStorage("hasSeenOnboardingTips.v1") private var hasSeenOnboardingTips: Bool = false
+
+    // Build placement selection (tap-to-place)
+    @State private var buildSpawnItem: BuildSpawnItem = .coin
     
     // 💀 新增：死亡/警告状态
     @State private var isWarning: Bool = false
@@ -53,8 +106,8 @@ struct ContentView: View {
     @State private var dangerLevel: Float = 0
 
     // ✅ 可调节的“路径容错”（不同场景：白线/马路牙子 vs 大马路）
-    @State private var warningDistance: Float = 0.6
-    @State private var deathDistance: Float = 1.2
+    @State private var warningDistance: Float = 0.20
+    @State private var deathDistance: Float = 0.8
     @State private var deathEnabled: Bool = true
     // 默认折叠，避免一打开就占屏
     @State private var showPathTuning: Bool = false
@@ -78,6 +131,7 @@ struct ContentView: View {
                 deathDistance: $deathDistance,
                 deathEnabled: $deathEnabled,
                 pathPenaltyArmed: $pathPenaltyArmed,
+                buildSpawnItem: $buildSpawnItem,
                 commands: $commands,
                 arReadyFinished: $arReadyFinished
             )
@@ -288,8 +342,8 @@ struct ContentView: View {
         withAnimation(.easeOut(duration: 0.15)) {
             showCelebration = true
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
-            withAnimation(.easeIn(duration: 0.25)) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            withAnimation(.easeIn(duration: 0.5)) {
                 showCelebration = false
             }
         }
@@ -406,15 +460,15 @@ private struct SuccessCelebrationOverlay: View {
         ZStack {
             ConfettiEmitterView()
                 .allowsHitTesting(false)
-            // 轻提示（可选）：更“高级”就别大字报
-            Text("SUCCESS")
-                .font(.system(.title, design: .rounded).weight(.heavy))
+            // Place the message just below the top bar (status + counter)
+            Text("Congrats! Merry Christmas!")
+                .font(.system(.title3, design: .rounded).weight(.heavy))
                 .foregroundStyle(.white)
                 .padding(.horizontal, 18)
                 .padding(.vertical, 10)
                 .background(.ultraThinMaterial, in: Capsule())
                 .shadow(radius: 12)
-                .padding(.top, 60)
+                .padding(.top, 126) // tuned to sit right below the top bar
                 .frame(maxHeight: .infinity, alignment: .top)
                 .allowsHitTesting(false)
         }
@@ -450,7 +504,7 @@ private struct ConfettiEmitterView: UIViewRepresentable {
             let cell = CAEmitterCell()
             cell.contents = img
             cell.birthRate = 14
-            cell.lifetime = 2.2
+            cell.lifetime = 3.6
             cell.velocity = 280
             cell.velocityRange = 140
             cell.emissionLongitude = .pi
@@ -468,7 +522,7 @@ private struct ConfettiEmitterView: UIViewRepresentable {
         view.layer.addSublayer(emitter)
 
         // 让粒子爆发更集中：短暂提高 birthRate，然后自动回落
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
             emitter.birthRate = 0.0
         }
 
@@ -587,6 +641,23 @@ extension ContentView {
     var buildControls: some View {
         HStack(spacing: 40) {
             
+            // Spawn picker (Build): choose what tap-to-place will create
+            Menu {
+                ForEach(BuildSpawnItem.allCases) { item in
+                    Button {
+                        buildSpawnItem = item
+                    } label: {
+                        Label(item.title, systemImage: item.systemImage)
+                    }
+                }
+            } label: {
+                Image(systemName: buildSpawnItem.systemImage)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(width: 50, height: 50)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+
             Button {
                 commands.resetToken = UUID()
                 withAnimation { pathStatus = .none }
