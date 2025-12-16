@@ -40,6 +40,12 @@ struct ContentView: View {
     @State private var collectedCoins: Int = 0
     @State private var commands = ARCommands()
     @State private var arReadyFinished: Bool = false
+
+    // AR side: becomes true after collecting the first "projected path item"
+    @State private var pathPenaltyArmed: Bool = false
+
+    // First-run tips (only show once)
+    @AppStorage("hasSeenOnboardingTips.v1") private var hasSeenOnboardingTips: Bool = false
     
     // 💀 新增：死亡/警告状态
     @State private var isWarning: Bool = false
@@ -71,6 +77,7 @@ struct ContentView: View {
                 warningDistance: $warningDistance,
                 deathDistance: $deathDistance,
                 deathEnabled: $deathEnabled,
+                pathPenaltyArmed: $pathPenaltyArmed,
                 commands: $commands,
                 arReadyFinished: $arReadyFinished
             )
@@ -109,6 +116,15 @@ struct ContentView: View {
                 SuccessCelebrationOverlay()
                     .ignoresSafeArea()
                     .transition(.opacity)
+            }
+
+            // First-run contextual tip (English, dismissible)
+            if !hasSeenOnboardingTips && mode != .gameOver {
+                FirstRunTipOverlay(
+                    message: onboardingMessage,
+                    onDismiss: { hasSeenOnboardingTips = true }
+                )
+                .transition(.opacity)
             }
             
             // ☠️ Game Over Overlay
@@ -199,10 +215,38 @@ struct ContentView: View {
             pathStatus = .none
             isWarning = false
             dangerLevel = 0
+            pathPenaltyArmed = false
             // 不重置 warning/death：让玩家的偏好保留
             collectedCoins = 0
             totalCoinsThisRun = 0
             showCelebration = false
+        }
+    }
+
+    // MARK: - First run tips
+    private var onboardingMessage: String {
+        switch mode {
+        case .build:
+            switch pathStatus {
+            case .none:
+                return "Tap the Walk button to start recording, then walk a few steps along your route."
+            case .recording:
+                return "Keep walking. Tap the Walk button again to stop recording."
+            case .recorded:
+                return "Tap the Checkmark to project the level: items + fireflies will appear along your path."
+            }
+        case .ready:
+            return "Projecting your level…"
+        case .play:
+            if pathPenaltyArmed {
+                return "Deviation penalty is now active. Stay close to the path."
+            } else {
+                return "Follow the fireflies. Neon orange-red means you're off the path."
+            }
+        case .gameOver:
+            return "Stay close to the fireflies to avoid failing."
+        case .result:
+            return "Nice! You can start a new run anytime."
         }
     }
 
@@ -432,6 +476,47 @@ private struct ConfettiEmitterView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+// MARK: - First run tip UI
+private struct FirstRunTipOverlay: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack {
+            Spacer()
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Quick Tip")
+                    .font(.system(.headline, design: .rounded).weight(.heavy))
+                    .foregroundStyle(.white)
+
+                Text(message)
+                    .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack {
+                    Spacer()
+                    Button("Got it") { onDismiss() }
+                        .font(.system(.headline, design: .rounded).weight(.heavy))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 10)
+                        .background(Color.white, in: Capsule())
+                }
+            }
+            .padding(16)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.35), radius: 16, y: 10)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 22)
+        }
+    }
 }
 
 // MARK: - UI Components

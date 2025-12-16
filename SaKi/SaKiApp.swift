@@ -20,7 +20,7 @@ struct SaKiApp: App {
 private struct RootView: View {
     @State private var showMain: Bool = false
     // 启动页最短显示时间（标题页更“稳”，避免一闪而过）
-    private let launchMinDurationNs: UInt64 = 1_500_000_000 // 1.5s
+    private let launchMinDurationNs: UInt64 = 2_000_000_000 // 2.0s
 
     var body: some View {
         ZStack {
@@ -45,8 +45,16 @@ private struct LaunchLoadingView: View {
         ZStack {
             LinearGradient(colors: [
                 Color.black,
-                Color(red: 0.06, green: 0.04, blue: 0.10)
+                // 稍微提亮一点点：仍然是“暗黑氛围”，但层次更明显
+                Color(red: 0.10, green: 0.08, blue: 0.16)
             ], startPoint: .top, endPoint: .bottom)
+            .ignoresSafeArea()
+
+            // 轻微的底部柔光（很克制）：让“标题页”更显眼但不破坏暗感
+            RadialGradient(colors: [
+                Color.white.opacity(0.08),
+                Color.clear
+            ], center: .bottom, startRadius: 0, endRadius: 420)
             .ignoresSafeArea()
 
             VStack(spacing: 18) {
@@ -60,6 +68,12 @@ private struct LaunchLoadingView: View {
                 Text("Loading AR session…")
                     .font(.system(.subheadline, design: .rounded).weight(.semibold))
                     .foregroundStyle(.white.opacity(0.85))
+
+                Text("Please be aware of your surroundings.")
+                    .font(.system(.footnote, design: .rounded).weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 2)
             }
             .padding(.horizontal, 24)
         }

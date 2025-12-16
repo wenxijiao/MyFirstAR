@@ -25,6 +25,7 @@ struct ARViewContainer: UIViewRepresentable {
     @Binding var warningDistance: Float
     @Binding var deathDistance: Float
     @Binding var deathEnabled: Bool
+    @Binding var pathPenaltyArmed: Bool
     @Binding var commands: ARCommands
     @Binding var arReadyFinished: Bool
 
@@ -39,6 +40,7 @@ struct ARViewContainer: UIViewRepresentable {
             warningDistance: $warningDistance,
             deathDistance: $deathDistance,
             deathEnabled: $deathEnabled,
+            pathPenaltyArmed: $pathPenaltyArmed,
             commands: $commands,
             arReadyFinished: $arReadyFinished
         )
@@ -101,6 +103,7 @@ struct ARViewContainer: UIViewRepresentable {
         private let warningDistance: Binding<Float>
         private let deathDistance: Binding<Float>
         private let deathEnabled: Binding<Bool>
+        private let pathPenaltyArmed: Binding<Bool>
         private let commands: Binding<ARCommands>
         private let arReadyFinished: Binding<Bool>
 
@@ -113,6 +116,7 @@ struct ARViewContainer: UIViewRepresentable {
              warningDistance: Binding<Float>,
              deathDistance: Binding<Float>,
              deathEnabled: Binding<Bool>,
+             pathPenaltyArmed: Binding<Bool>,
              commands: Binding<ARCommands>,
              arReadyFinished: Binding<Bool>) {
 
@@ -125,6 +129,7 @@ struct ARViewContainer: UIViewRepresentable {
             self.warningDistance = warningDistance
             self.deathDistance = deathDistance
             self.deathEnabled = deathEnabled
+            self.pathPenaltyArmed = pathPenaltyArmed
             self.commands = commands
             self.arReadyFinished = arReadyFinished
             // ✅ 关键：避免第一次 updateUIView 时把所有 token 都当成“变化”
@@ -278,8 +283,9 @@ struct ARViewContainer: UIViewRepresentable {
                 collectedCoins.wrappedValue = 0
                 playStartedAt = CACurrentMediaTime()
                 // ✅ Play 切入时先不上惩罚：等玩家捡到第一个“路径生成物”再开启警告/死亡判定
-                pathPenaltyArmed = false
+                pathPenaltyArmedInternal = false
                 pathVisualDangerLevel = 0
+                pathPenaltyArmed.wrappedValue = false
 
                 // mesh 已在启动时启用（设备支持时）
 
@@ -448,16 +454,9 @@ struct ARViewContainer: UIViewRepresentable {
         private var flowAnchor: AnchorEntity?
         // iOS17+ 粒子版：只用一个 emitter 实体模拟虫群（更轻量、更“官方”）
         private var flowEmitterEntity: Entity?
-        private var flowSprites: [ModelEntity] = []
-        // swarm center cursor (single cluster moving along path)
-        private var flowCenterCursor: Float = 0
-        private var flowOffsets: [SIMD3<Float>] = []
         private var flowSamples: [SIMD3<Float>] = []
-        private var flowBaseOpacity: [Float] = []
-        private var flowPhaseA: [Float] = []
-        private var flowPhaseB: [Float] = []
         private let flowSpacing: Float = 0.22
-        // “萤火虫簇”：一团虫群沿路径飞行（更像活物，不像画线）
+        // “萤火虫簇”：每团虫群包含的精灵数量
         private let flowCount: Int = 10
         private let flowSpeed: Float = 0.50            // 虫群整体沿路径移动速度：恢复到原来（刚刚好）
         private let flowHeightOffset: Float = 0.22     // 更高一些，避免像“地面提示”
@@ -474,6 +473,32 @@ struct ARViewContainer: UIViewRepresentable {
         private let flowSwarmCohesion: Float = 0.18    // 越大越聚（用于轻微拉回）
         // ✅ 路径提示：固定一群“虫群实体”（像之前小球一样），不要持续发射新粒子
         private let flowUseParticleEmitter: Bool = false
+
+        // ✅ 多虫群：每隔一段时间生成一团新的虫群沿路飞（长路径更易看到）
+        private let flowSwarmSpawnInterval: CFTimeInterval = 5.0
+        private let flowSwarmLifetime: CFTimeInterval = 18.0
+        private let flowMaxSwarms: Int = 4
+        private var flowLastSwarmSpawnAt: CFTimeInterval = 0
+        // 让虫群移动方向与玩家行走方向一致（如果之前是反的，这里改为 -1）
+        private let flowMoveDirectionSign: Float = -1
+        // 用于从玩家位置附近生成虫群（减少“看不到”的情况）
+        private var lastNearestFlowSampleIndex: Int = 0
+        // iOS17+ 单 emitter 模式的游标（避免引用旧的 flowCenterCursor）
+        private var flowEmitterCursor: Float = 0
+        // 缓存 mesh，避免周期性创建资源导致“卡一下”
+        private var flowSwarmMesh: MeshResource?
+
+        private struct FlowSwarm {
+            var spawnedAt: CFTimeInterval
+            var cursor: Float
+            var sprites: [ModelEntity]
+            var offsets: [SIMD3<Float>]
+            var baseOpacity: [Float]
+            var phaseA: [Float]
+            var phaseB: [Float]
+            var normalColors: [UIColor]
+        }
+        private var flowSwarms: [FlowSwarm] = []
 
         // MARK: - Coin pop sparkle (lightweight particles)
         private var sparkleAnchors: [AnchorEntity] = []
@@ -790,76 +815,38 @@ struct ARViewContainer: UIViewRepresentable {
                                                        max(0.02, flowSwarmLengthForward * 0.35))
 
                 e.components.set(emitter)
+                flowEmitterCursor = 0
                 return
             }
 
             // 改成“发光小球”来保证一定可见（不依赖 alpha/纹理混合）
             let mesh = MeshResource.generateSphere(radius: flowSpriteSize * 0.45)
+            flowSwarmMesh = mesh
 
-            flowSprites.removeAll()
-            flowCenterCursor = 0
-            flowOffsets.removeAll()
-            flowBaseOpacity.removeAll()
-            flowPhaseA.removeAll()
-            flowPhaseB.removeAll()
-            flowNormalColors.removeAll()
+            flowSwarms.removeAll()
             lastAppliedFlowAlarmQuant = -1
-            flowSprites.reserveCapacity(flowCount)
-            flowOffsets.reserveCapacity(flowCount)
-            flowBaseOpacity.reserveCapacity(flowCount)
-            flowPhaseA.reserveCapacity(flowCount)
-            flowPhaseB.reserveCapacity(flowCount)
-            flowNormalColors.reserveCapacity(flowCount)
+            flowLastSwarmSpawnAt = 0
+            lastNearestFlowSampleIndex = 0
+            flowEmitterCursor = 0
 
-            // 让虫群从路径上的随机位置开始
-            let maxIdx = Float(flowSamples.count - 1)
-            flowCenterCursor = Float.random(in: 0..<max(1, maxIdx))
-
-            for i in 0..<flowCount {
-                // 每只萤火虫一个轻微不同的色相（只生成一次，不每帧改材质）
-                let baseColor = randomFireflyBaseColor()
-                var mat = UnlitMaterial()
-                mat.color = .init(tint: baseColor.withAlphaComponent(1.0))
-
-                let e = ModelEntity(mesh: mesh, materials: [mat])
-                e.position = SIMD3<Float>(repeating: 0)
-                a.addChild(e)
-                flowSprites.append(e)
-                flowNormalColors.append(baseColor)
-
-                // 初始随机分布在一个“椭球”内（狭长虫群）
-                let ox = Float.random(in: -1...1) * flowSwarmRadiusSide
-                let oy = abs(Float.random(in: -1...1)) * flowSwarmRadiusUp
-                let oz = Float.random(in: -1...1) * flowSwarmLengthForward
-                flowOffsets.append(SIMD3<Float>(ox, oy, oz))
-
-                // “萤火虫”特征：前面更亮、后面更淡，再叠加随机闪烁
-                let t = Float(i) / max(1, Float(flowCount - 1))
-                let baseOpacity = (0.35 + 0.60 * (1 - t)) * flowSpriteAlpha
-                flowBaseOpacity.append(baseOpacity)
-                flowPhaseA.append(Float.random(in: 0..<(2 * .pi)))
-                flowPhaseB.append(Float.random(in: 0..<(2 * .pi)))
-
-                e.components.set(OpacityComponent(opacity: baseOpacity))
-            }
-
-            // 初始外观：按照当前报警值刷一次（避免切回 play 时状态不同步）
+            // 先生成第一团虫群（确保立刻可见）
+            spawnFlowSwarm(mesh: mesh)
             applyFlowAlarmAppearanceIfNeeded()
         }
 
         private func clearFlowGuide() {
             flowEmitterEntity?.removeFromParent()
             flowEmitterEntity = nil
-            flowSprites.forEach { $0.removeFromParent() }
-            flowSprites.removeAll()
-            flowCenterCursor = 0
-            flowOffsets.removeAll()
             flowSamples.removeAll()
-            flowBaseOpacity.removeAll()
-            flowPhaseA.removeAll()
-            flowPhaseB.removeAll()
-            flowNormalColors.removeAll()
             lastAppliedFlowAlarmQuant = -1
+            flowSwarms.forEach { s in
+                s.sprites.forEach { $0.removeFromParent() }
+            }
+            flowSwarms.removeAll()
+            flowLastSwarmSpawnAt = 0
+            lastNearestFlowSampleIndex = 0
+            flowEmitterCursor = 0
+            flowSwarmMesh = nil
             flowAnchor?.removeFromParent()
             flowAnchor = nil
         }
@@ -979,26 +966,26 @@ struct ARViewContainer: UIViewRepresentable {
             // iOS17+ 粒子虫群版：只移动一个 emitter（避免一堆实体）
             if #available(iOS 17.0, *), flowUseParticleEmitter, let e = flowEmitterEntity {
                 let dt = Float(deltaTime)
-                let advancePoints = (flowSpeed * dt) / max(1e-6, flowSpacing)
+                let advancePoints = ((flowSpeed * dt) / max(1e-6, flowSpacing)) * flowMoveDirectionSign
                 let maxIdx = Float(flowSamples.count - 1)
 
-                flowCenterCursor += advancePoints
-                if flowCenterCursor >= maxIdx { flowCenterCursor -= maxIdx }
+                flowEmitterCursor += advancePoints
+                if flowEmitterCursor >= maxIdx { flowEmitterCursor -= maxIdx }
+                if flowEmitterCursor < 0 { flowEmitterCursor += maxIdx }
 
-                let c = flowCenterCursor
-                let idx = Int(c)
-                let frac = c - Float(idx)
-                let p0 = flowSamples[idx]
-                let p1 = flowSamples[min(idx + 1, flowSamples.count - 1)]
-                let centerPos = p0 + (p1 - p0) * frac
+                // ✅ Catmull-Rom：更平滑的中心轨迹 + 切线方向
+                let s = flowCenterAndTangent(cursor: flowEmitterCursor)
+                let centerPos = s.center
 
-                var forward = SIMD3<Float>(p1.x - p0.x, 0, p1.z - p0.z)
-                if simd_length_squared(forward) < 1e-6 { forward = SIMD3<Float>(0, 0, -1) }
-                forward = simd_normalize(forward)
+                // ✅ 用“运动方向”构建局部坐标系：与整体移动方向一致（避免群内方向割裂）
+                var motionForward = SIMD3<Float>(s.tangent.x, 0, s.tangent.z)
+                if simd_length_squared(motionForward) < 1e-6 { motionForward = SIMD3<Float>(0, 0, -1) }
+                motionForward = simd_normalize(motionForward)
+                if flowMoveDirectionSign < 0 { motionForward = -motionForward }
 
                 // 让 emitter 的“本地 +Z”对齐到路径 forward，这样 emissionDirection=(0,*,1) 就真的是“沿路飞”
                 let up = SIMD3<Float>(0, 1, 0)
-                var right = simd_cross(up, forward)
+                var right = simd_cross(up, motionForward)
                 if simd_length_squared(right) < 1e-6 { right = SIMD3<Float>(1, 0, 0) }
                 right = simd_normalize(right)
                 let fwd = simd_normalize(simd_cross(right, up))
@@ -1037,102 +1024,140 @@ struct ARViewContainer: UIViewRepresentable {
             }
 
             // 旧版（iOS17 以下）小球虫群
-            guard flowSprites.count == flowOffsets.count, !flowSprites.isEmpty else { return }
+            guard !flowSwarms.isEmpty else { return }
 
             let dt = Float(deltaTime)
-            let advancePoints = (flowSpeed * dt) / max(1e-6, flowSpacing)
             let maxIdx = Float(flowSamples.count - 1)
 
-            // 让“虫群中心”沿路径循环移动
-            flowCenterCursor += advancePoints
-            if flowCenterCursor >= maxIdx { flowCenterCursor -= maxIdx }
+            // ✅ 每隔 N 秒生成一团新的虫群（长路径更容易看到）
+            let now = CACurrentMediaTime()
+            if flowLastSwarmSpawnAt == 0 { flowLastSwarmSpawnAt = now }
+            if (now - flowLastSwarmSpawnAt) >= flowSwarmSpawnInterval {
+                // ✅ 用缓存 mesh，避免周期性创建导致“卡一下”
+                if let mesh = flowSwarmMesh {
+                    spawnFlowSwarm(mesh: mesh)
+                }
+                flowLastSwarmSpawnAt = now
+            }
 
-            let c = flowCenterCursor
-            let idx = Int(c)
-            let frac = c - Float(idx)
-            let p0 = flowSamples[idx]
-            let p1 = flowSamples[min(idx + 1, flowSamples.count - 1)]
-            let centerPos = p0 + (p1 - p0) * frac
-
-            // 构建一个“沿路径方向”的局部坐标系：forward/right/up
-            var forward = SIMD3<Float>(p1.x - p0.x, 0, p1.z - p0.z)
-            if simd_length_squared(forward) < 1e-6 { forward = SIMD3<Float>(0, 0, -1) }
-            forward = simd_normalize(forward)
-            let up = SIMD3<Float>(0, 1, 0)
-            var right = simd_cross(up, forward)
-            if simd_length_squared(right) < 1e-6 { right = SIMD3<Float>(1, 0, 0) }
-            right = simd_normalize(right)
+            // 清理过期 swarm，避免无限增长
+            if flowSwarms.count > flowMaxSwarms || flowSwarms.contains(where: { now - $0.spawnedAt > flowSwarmLifetime }) {
+                var kept: [FlowSwarm] = []
+                kept.reserveCapacity(min(flowSwarms.count, flowMaxSwarms))
+                for s in flowSwarms {
+                    if (now - s.spawnedAt) <= flowSwarmLifetime {
+                        kept.append(s)
+                    } else {
+                        s.sprites.forEach { $0.removeFromParent() }
+                    }
+                }
+                if kept.count > flowMaxSwarms {
+                    // 超出上限时丢掉最老的
+                    let overflow = kept.count - flowMaxSwarms
+                    for i in 0..<overflow {
+                        kept[i].sprites.forEach { $0.removeFromParent() }
+                    }
+                    kept.removeFirst(overflow)
+                }
+                flowSwarms = kept
+            }
 
             // 交互：靠近玩家时散开
-            let dxC = camPos.x - centerPos.x
-            let dzC = camPos.z - centerPos.z
-            let distCenterXZ = sqrt(dxC*dxC + dzC*dzC)
-            let scatterStrength = max(0, min(1, (0.85 - distCenterXZ) / 0.85)) // 0..1
-
-            // ✅ 萤火虫“报警模式”：
-            // - 超过 warningDistance：立刻切成霓虹警示红/橙红
-            // - 偏离越远：闪烁越快（形成更强的“回到路径”引导）
+            // ✅ 萤火虫“报警模式”：超过 warningDistance 立刻变色，偏离越远闪烁越快
             let alarm = max(0, min(1, pathVisualDangerLevel))
             let flickerSpeed = flowFlickerSpeed * (1.0 + 3.2 * alarm)
             applyFlowAlarmAppearanceIfNeeded()
 
-            for i in 0..<flowSprites.count {
-                // 轻微“群聚力”：把偏离的 offset 慢慢拉回
-                var o = flowOffsets[i]
-                o *= (1 - flowSwarmCohesion * dt)
+            // 更新玩家最近的 sample index（用于生成新 swarm 的起点更合理）
+            updateNearestFlowSampleIndex(camPos: camPos)
 
-                // 萤火虫自己的 flutter（局部随机游走）
-                let pha = flowPhaseA[i] + time * 1.55
-                let phb = flowPhaseB[i] + time * 1.05
-                let flutter = SIMD3<Float>(
-                    sin(phb) * flowWobbleAmpXZ,
-                    sin(pha) * flowBobAmpY,
-                    cos(phb) * flowWobbleAmpXZ
-                )
-                o += flutter * dt
+            let advancePoints = ((flowSpeed * dt) / max(1e-6, flowSpacing)) * flowMoveDirectionSign
 
-                if scatterStrength > 0.001 {
-                    let outward = SIMD3<Float>(o.x, o.y * 0.7, o.z)
-                    let len = max(1e-4, simd_length(outward))
-                    o += (outward / len) * (0.18 * scatterStrength) * dt
+            for si in 0..<flowSwarms.count {
+                // 移动 swarm 中心
+                flowSwarms[si].cursor += advancePoints
+                if flowSwarms[si].cursor >= maxIdx { flowSwarms[si].cursor -= maxIdx }
+                if flowSwarms[si].cursor < 0 { flowSwarms[si].cursor += maxIdx }
+
+                // ✅ Catmull-Rom：更平滑的中心轨迹 + 切线方向
+                let s = flowCenterAndTangent(cursor: flowSwarms[si].cursor)
+                let centerPos = s.center
+
+                // 构建一个“沿路径方向”的局部坐标系：forward/right/up（与整体推进同向）
+                var motionForward = SIMD3<Float>(s.tangent.x, 0, s.tangent.z)
+                if simd_length_squared(motionForward) < 1e-6 { motionForward = SIMD3<Float>(0, 0, -1) }
+                motionForward = simd_normalize(motionForward)
+                if flowMoveDirectionSign < 0 { motionForward = -motionForward }
+                let up = SIMD3<Float>(0, 1, 0)
+                var right = simd_cross(up, motionForward)
+                if simd_length_squared(right) < 1e-6 { right = SIMD3<Float>(1, 0, 0) }
+                right = simd_normalize(right)
+
+                let dxC = camPos.x - centerPos.x
+                let dzC = camPos.z - centerPos.z
+                let distCenterXZ = sqrt(dxC*dxC + dzC*dzC)
+                let scatterStrength = max(0, min(1, (0.85 - distCenterXZ) / 0.85)) // 0..1
+
+                // 更新 swarm 内每只精灵
+                let swarmCount = flowSwarms[si].sprites.count
+                guard swarmCount == flowSwarms[si].offsets.count else { continue }
+
+                for i in 0..<swarmCount {
+                    // 轻微“群聚力”：把偏离的 offset 慢慢拉回
+                    var o = flowSwarms[si].offsets[i]
+                    o *= (1 - flowSwarmCohesion * dt)
+
+                    // 萤火虫自己的 flutter（局部随机游走）
+                    let pha = flowSwarms[si].phaseA[i] + time * 1.55
+                    let phb = flowSwarms[si].phaseB[i] + time * 1.05
+                    let flutter = SIMD3<Float>(
+                        sin(phb) * flowWobbleAmpXZ,
+                        sin(pha) * flowBobAmpY,
+                        cos(phb) * flowWobbleAmpXZ
+                    )
+                    o += flutter * dt
+
+                    if scatterStrength > 0.001 {
+                        let outward = SIMD3<Float>(o.x, o.y * 0.7, o.z)
+                        let len = max(1e-4, simd_length(outward))
+                        o += (outward / len) * (0.18 * scatterStrength) * dt
+                    }
+
+                    // 前后方向再给一点 jitter，让群更“活”
+                    let fJ = (sin(pha * 1.3) * 0.5 + 0.5) * flowSwarmForwardJitter
+                    let local = right * o.x + up * o.y + motionForward * (o.z + fJ)
+                    flowSwarms[si].offsets[i] = o
+
+                    var pos = centerPos + local
+
+                    // 让它更“飞”：离相机太近时略微抬高一点点，避免贴脸像 UI
+                    let dx = camPos.x - pos.x
+                    let dz = camPos.z - pos.z
+                    let distXZ = sqrt(dx*dx + dz*dz)
+                    if distXZ < 0.55 {
+                        pos.y += (0.55 - distXZ) * 0.08
+                    }
+
+                    // 呼吸 + 闪烁
+                    let pulsePhase = (Float(i) * 0.55) + time * 2.0
+                    let pulse = (sin(pulsePhase) + 1) * 0.5
+                    let flicker = (sin(flowSwarms[si].phaseB[i] + time * flickerSpeed) + 1) * 0.5
+                    let scale = 0.70 + 0.55 * pulse
+                    let alpha = min(1.0, max(0.04, flowSwarms[si].baseOpacity[i] * (0.18 + (0.82 + 1.10 * alarm) * flicker)))
+
+                    let sprite = flowSwarms[si].sprites[i]
+                    sprite.position = pos
+                    sprite.scale = SIMD3<Float>(repeating: scale)
+                    sprite.components.set(OpacityComponent(opacity: alpha))
                 }
-
-                // 前后方向再给一点 jitter，让群更“活”
-                let fJ = (sin(pha * 1.3) * 0.5 + 0.5) * flowSwarmForwardJitter
-                let local = right * o.x + up * o.y + forward * (o.z + fJ)
-                flowOffsets[i] = o
-
-                var pos = centerPos + local
-
-                // 让它更“飞”：离相机太近时略微抬高一点点，避免贴脸像 UI
-                let dx = camPos.x - pos.x
-                let dz = camPos.z - pos.z
-                let distXZ = sqrt(dx*dx + dz*dz)
-                if distXZ < 0.55 {
-                    pos.y += (0.55 - distXZ) * 0.08
-                }
-
-                // 呼吸 + 闪烁
-                let pulsePhase = (Float(i) * 0.55) + time * 2.0
-                let pulse = (sin(pulsePhase) + 1) * 0.5
-                let flicker = (sin(flowPhaseB[i] + time * flickerSpeed) + 1) * 0.5
-                let scale = 0.70 + 0.55 * pulse
-                let alpha = min(1.0, max(0.04, flowBaseOpacity[i] * (0.18 + (0.82 + 1.10 * alarm) * flicker)))
-
-                let sprite = flowSprites[i]
-                sprite.position = pos
-                sprite.scale = SIMD3<Float>(repeating: scale)
-                sprite.components.set(OpacityComponent(opacity: alpha))
             }
         }
 
         // MARK: - Flow alarm appearance (color shift + cached updates)
-        private var flowNormalColors: [UIColor] = []
         private var lastAppliedFlowAlarmQuant: Int = -1
 
         private func applyFlowAlarmAppearanceIfNeeded() {
-            guard !flowSprites.isEmpty else { return }
-            guard flowSprites.count == flowNormalColors.count else { return }
+            guard !flowSwarms.isEmpty else { return }
 
             let alarm = max(0, min(1, pathVisualDangerLevel))
             // 超过 warningDistance：立刻切红（pathVisualDangerLevel > 0）
@@ -1142,16 +1167,187 @@ struct ARViewContainer: UIViewRepresentable {
             guard quant != lastAppliedFlowAlarmQuant else { return }
             lastAppliedFlowAlarmQuant = quant
 
-            for i in 0..<flowSprites.count {
-                let base = flowNormalColors[i]
-                // 霓虹警示红/橙红（更“刺”一点，但仍然干净）
-                let alarmNeon = UIColor(red: 1.0, green: 0.33, blue: 0.05, alpha: 1.0)
-                let tint = isAlarmOn ? alarmNeon : base
-                let e = flowSprites[i]
-                guard var mat = e.model?.materials.first as? UnlitMaterial else { continue }
-                mat.color = .init(tint: tint.withAlphaComponent(1.0))
-                e.model?.materials = [mat]
+            // 霓虹警示红/橙红（更“刺”一点，但仍然干净）
+            let alarmNeon = UIColor(red: 1.0, green: 0.33, blue: 0.05, alpha: 1.0)
+
+            for si in 0..<flowSwarms.count {
+                guard flowSwarms[si].sprites.count == flowSwarms[si].normalColors.count else { continue }
+                for i in 0..<flowSwarms[si].sprites.count {
+                    let base = flowSwarms[si].normalColors[i]
+                    let tint = isAlarmOn ? alarmNeon : base
+                    let e = flowSwarms[si].sprites[i]
+                    guard var mat = e.model?.materials.first as? UnlitMaterial else { continue }
+                    mat.color = .init(tint: tint.withAlphaComponent(1.0))
+                    e.model?.materials = [mat]
+                }
             }
+        }
+
+        // MARK: - Flow swarm spawn / nearest index
+        // MARK: - Flow spline (Catmull-Rom) for smoother motion
+        @inline(__always)
+        private func vAdd(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> SIMD3<Float> {
+            SIMD3<Float>(a.x + b.x, a.y + b.y, a.z + b.z)
+        }
+
+        @inline(__always)
+        private func vSub(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> SIMD3<Float> {
+            SIMD3<Float>(a.x - b.x, a.y - b.y, a.z - b.z)
+        }
+
+        @inline(__always)
+        private func vScale(_ v: SIMD3<Float>, _ s: Float) -> SIMD3<Float> {
+            SIMD3<Float>(v.x * s, v.y * s, v.z * s)
+        }
+
+        private func catmullRom(_ p0: SIMD3<Float>, _ p1: SIMD3<Float>, _ p2: SIMD3<Float>, _ p3: SIMD3<Float>, t: Float) -> SIMD3<Float> {
+            // Uniform Catmull-Rom spline (0.5 tension)
+            let tt = max(0, min(1, t))
+            let t2 = tt * tt
+            let t3 = t2 * tt
+            // 拆分表达式：避免编译器在 SIMD + 标量混合运算上 type-check 超时
+            var out = vScale(p1, 2)
+            out = vAdd(out, vScale(vSub(p2, p0), tt))
+
+            var c3 = vScale(p0, 2)
+            c3 = vSub(c3, vScale(p1, 5))
+            c3 = vAdd(c3, vScale(p2, 4))
+            c3 = vSub(c3, p3)
+            out = vAdd(out, vScale(c3, t2))
+
+            var c4 = vSub(vScale(p1, 3), p0)
+            c4 = vSub(c4, vScale(p2, 3))
+            c4 = vAdd(c4, p3)
+            out = vAdd(out, vScale(c4, t3))
+
+            return vScale(out, 0.5)
+        }
+
+        private func catmullRomTangent(_ p0: SIMD3<Float>, _ p1: SIMD3<Float>, _ p2: SIMD3<Float>, _ p3: SIMD3<Float>, t: Float) -> SIMD3<Float> {
+            // d/dt of the uniform Catmull-Rom above
+            let tt = max(0, min(1, t))
+            let t2 = tt * tt
+            var out = vSub(p2, p0)
+
+            var c2 = vScale(p0, 2)
+            c2 = vSub(c2, vScale(p1, 5))
+            c2 = vAdd(c2, vScale(p2, 4))
+            c2 = vSub(c2, p3)
+            out = vAdd(out, vScale(c2, 2 * tt))
+
+            var c3 = vSub(vScale(p1, 3), p0)
+            c3 = vSub(c3, vScale(p2, 3))
+            c3 = vAdd(c3, p3)
+            out = vAdd(out, vScale(c3, 3 * t2))
+
+            return vScale(out, 0.5)
+        }
+
+        private func flowCenterAndTangent(cursor: Float) -> (center: SIMD3<Float>, tangent: SIMD3<Float>) {
+            // cursor in [0, n-1)
+            let n = flowSamples.count
+            guard n >= 2 else { return (.zero, SIMD3<Float>(0, 0, -1)) }
+
+            let maxIdx = Float(n - 1)
+            var c = cursor
+            if c < 0 { c = 0 }
+            if c >= maxIdx { c = maxIdx - 1e-4 }
+
+            let i = min(max(0, Int(c)), n - 2)
+            let t = c - Float(i)
+
+            let p1 = flowSamples[i]
+            let p2 = flowSamples[i + 1]
+            let p0 = flowSamples[max(0, i - 1)]
+            let p3 = flowSamples[min(n - 1, i + 2)]
+
+            let center = catmullRom(p0, p1, p2, p3, t: t)
+            let tan = catmullRomTangent(p0, p1, p2, p3, t: t)
+            return (center, tan)
+        }
+
+        private func updateNearestFlowSampleIndex(camPos: SIMD3<Float>) {
+            guard flowSamples.count >= 2 else { return }
+            let n = flowSamples.count
+            if lastNearestFlowSampleIndex >= n { lastNearestFlowSampleIndex = max(0, n - 1) }
+
+            var best: Float = .greatestFiniteMagnitude
+            var bestIdx: Int = lastNearestFlowSampleIndex
+            let window = 140
+            let lo = max(0, lastNearestFlowSampleIndex - window)
+            let hi = min(n - 1, lastNearestFlowSampleIndex + window)
+            for i in lo...hi {
+                let p = flowSamples[i]
+                let dx = camPos.x - p.x
+                let dz = camPos.z - p.z
+                let d = dx*dx + dz*dz
+                if d < best {
+                    best = d
+                    bestIdx = i
+                }
+            }
+            lastNearestFlowSampleIndex = bestIdx
+        }
+
+        private func spawnFlowSwarm(mesh: MeshResource) {
+            guard let a = flowAnchor else { return }
+            guard flowSamples.count >= 2 else { return }
+
+            // 让新 swarm 从玩家附近的路径点开始（略偏后方），避免“生成在你前面但你已经走过了看不到”
+            let spawnBehindMeters: Float = 1.6
+            let spawnBehindPoints = max(0, Int(spawnBehindMeters / max(1e-6, flowSpacing)))
+            let n = max(2, flowSamples.count)
+            var startIdx = lastNearestFlowSampleIndex - spawnBehindPoints
+            while startIdx < 0 { startIdx += n }
+            while startIdx >= n { startIdx -= n }
+            let cursor = Float(startIdx)
+
+            var swarm = FlowSwarm(
+                spawnedAt: CACurrentMediaTime(),
+                cursor: cursor,
+                sprites: [],
+                offsets: [],
+                baseOpacity: [],
+                phaseA: [],
+                phaseB: [],
+                normalColors: []
+            )
+            swarm.sprites.reserveCapacity(flowCount)
+            swarm.offsets.reserveCapacity(flowCount)
+            swarm.baseOpacity.reserveCapacity(flowCount)
+            swarm.phaseA.reserveCapacity(flowCount)
+            swarm.phaseB.reserveCapacity(flowCount)
+            swarm.normalColors.reserveCapacity(flowCount)
+
+            for i in 0..<flowCount {
+                let baseColor = randomFireflyBaseColor()
+                var mat = UnlitMaterial()
+                mat.color = .init(tint: baseColor.withAlphaComponent(1.0))
+
+                let e = ModelEntity(mesh: mesh, materials: [mat])
+                e.position = .zero
+                a.addChild(e)
+                swarm.sprites.append(e)
+                swarm.normalColors.append(baseColor)
+
+                // 初始随机分布在一个“椭球”内（狭长虫群）
+                let ox = Float.random(in: -1...1) * flowSwarmRadiusSide
+                let oy = abs(Float.random(in: -1...1)) * flowSwarmRadiusUp
+                // ✅ 让更多精灵落在“运动方向的后方”，整体观感更像同向飞行（不割裂）
+                let oz = Float.random(in: -1.0...0.2) * flowSwarmLengthForward
+                swarm.offsets.append(SIMD3<Float>(ox, oy, oz))
+
+                // 前亮后暗
+                let t = Float(i) / max(1, Float(flowCount - 1))
+                let baseOpacity = (0.35 + 0.60 * (1 - t)) * flowSpriteAlpha
+                swarm.baseOpacity.append(baseOpacity)
+                swarm.phaseA.append(Float.random(in: 0..<(2 * .pi)))
+                swarm.phaseB.append(Float.random(in: 0..<(2 * .pi)))
+
+                e.components.set(OpacityComponent(opacity: baseOpacity))
+            }
+
+            flowSwarms.append(swarm)
         }
 
         private func placePathCoinDebugMarker(at worldPos: SIMD3<Float>, index: Int) {
@@ -1331,8 +1527,9 @@ struct ARViewContainer: UIViewRepresentable {
             spawnTask?.cancel()
             spawnTask = nil
             // ✅ 新一轮准备：惩罚逻辑重新上锁（等玩家捡到第一个路径生成物才开始判定）
-            pathPenaltyArmed = false
+            pathPenaltyArmedInternal = false
             pathVisualDangerLevel = 0
+            pathPenaltyArmed.wrappedValue = false
 
             // 1) mode 进入 ready（UI 已经先切了，这里保证一致）
             mode.wrappedValue = .ready
@@ -1676,8 +1873,9 @@ struct ARViewContainer: UIViewRepresentable {
                 self.playCoinSound()
 
                 // ✅ 惩罚逻辑（警告/死亡）解锁：玩家收集到第一个“路径生成物”后才开始
-                if wasPathCoin, !self.pathPenaltyArmed {
-                    self.pathPenaltyArmed = true
+                if wasPathCoin, !self.pathPenaltyArmedInternal {
+                    self.pathPenaltyArmedInternal = true
+                    self.pathPenaltyArmed.wrappedValue = true
                     // 给一个新的 grace：避免“刚解锁就瞬间触发警告/判死”
                     self.playStartedAt = CACurrentMediaTime()
                 }
@@ -1754,7 +1952,7 @@ struct ARViewContainer: UIViewRepresentable {
             pathVisualDangerLevel = visual
 
             // ✅ 惩罚逻辑（警告/死亡）只有在“收集到第一个路径生成物”后才开始
-            guard pathPenaltyArmed else {
+            guard pathPenaltyArmedInternal else {
                 isWarning.wrappedValue = false
                 dangerLevel.wrappedValue = 0
                 return
@@ -1821,9 +2019,10 @@ struct ARViewContainer: UIViewRepresentable {
             // timers
             time = 0
             isPreparingLevel = false
-            pathPenaltyArmed = false
+            pathPenaltyArmedInternal = false
             pathVisualDangerLevel = 0
             isPathCoinById.removeAll()
+            pathPenaltyArmed.wrappedValue = false
 
             // reset 后如果订阅曾经被取消，重新启动 update loop（不影响已存在的订阅）
             startUpdateLoop()
@@ -1863,7 +2062,7 @@ struct ARViewContainer: UIViewRepresentable {
 
         // MARK: - Path penalty gating + visual alarm
         // 惩罚（警告/死亡）是否已解锁：玩家收集到第一个“路径生成物”后才开始判定
-        private var pathPenaltyArmed: Bool = false
+        private var pathPenaltyArmedInternal: Bool = false
         // 用于“萤火虫报警模式”的可视化危险值（0~1）；不依赖是否解锁惩罚
         private var pathVisualDangerLevel: Float = 0
         // 记录每个 coin 是否为路径生成物（用于解锁惩罚）
